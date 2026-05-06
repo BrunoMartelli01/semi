@@ -1,5 +1,48 @@
-import json, zipfile
+import json, zipfile, re
 from collections import defaultdict
+
+# Regex: almeno 3 coppie di interi separati da virgola, poi ,#### e testo opzionale
+# Questo garantisce che il parser rrc_evaluation_funcs non vada mai in IndexError
+VALID_LINE_RE = re.compile(
+    r'^(-?\d+,-?\d+)(-?,-?\d+,-?\d+)+(,####.*)$'
+)
+
+def make_gt_line(ann):
+    """Restituisce la stringa della riga GT oppure None se malformata."""
+    seg = ann.get('segmentation', [[]])
+    if not seg or not seg[0]:
+        return None
+    seg = seg[0]
+    if len(seg) % 2 != 0 or len(seg) < 6:
+        return None
+
+    coords = ','.join(str(int(round(v))) for v in seg)
+    if not coords or coords.startswith(','):
+        return None
+
+    text    = ann.get('text', '').strip().lower()
+    ignored = ann.get('ignore', 0) == 1 or text == ''
+
+    if ignored:
+        line = f"{coords},####"
+    else:
+        # rimuovi qualsiasi occorrenza di #### nel testo (romperebbe lo split)
+        safe_text = text.replace('####', '').strip()
+        line = f"{coords},####{safe_text}" if safe_text else f"{coords},####"
+
+    # validazione finale: la riga deve matchare il formato atteso dal parser
+    if not VALID_LINE_RE.match(line):
+        return None
+
+    # doppio controllo: split su ,#### deve dare esattamente 2 parti
+    parts = line.split(',####')
+    if len(parts) != 2:
+        return None
+    if len(parts[0].split(',')) < 6:
+        return None
+
+    return line
+
 
 with open('datasets/hiertext/test_gt_source.json') as f:
     data = json.load(f)
@@ -9,7 +52,7 @@ for ann in data['annotations']:
     ann_by_img[ann['image_id']].append(ann)
 
 out_zip = 'datasets/evaluation/gt_hiertext.zip'
-bad_lines_total = 0
+skipped_total = 0
 
 with zipfile.ZipFile(out_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
     for img in data['images']:
@@ -18,47 +61,19 @@ with zipfile.ZipFile(out_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
         lines    = []
 
         for ann in ann_by_img[img_id]:
-            seg = ann['segmentation'][0]
-
-            # salta se coordinate malformate
-            if not seg or len(seg) % 2 != 0 or len(seg) < 6:
-                bad_lines_total += 1
+            line = make_gt_line(ann)
+            if line is None:
+                skipped_total += 1
                 continue
-
-            coords  = ','.join(str(int(round(v))) for v in seg)
-
-            # salta se coords vuote o iniziano con virgola
-            if not coords or coords.startswith(','):
-                bad_lines_total += 1
-                continue
-
-            text    = ann.get('text', '').strip().lower()
-            ignored = ann.get('ignore', 0) == 1 or text == ''
-
-            if ignored:
-                # righe ignorate: delimitatore #### con testo vuoto
-                # il parser si aspetta ptr[1] dopo split(',####') quindi
-                # il formato corretto e' coords,####
-                line = f"{coords},####"
-            else:
-                # sanifica il testo: rimuovi caratteri che rompono il parsing
-                # il parser usa split(',####') quindi #### nel testo e' pericoloso
-                safe_text = text.replace('####', '').strip()
-                if safe_text == '':
-                    line = f"{coords},####"
-                else:
-                    line = f"{coords},####{safe_text}"
-
             lines.append(line)
 
-        # scrivi senza riga vuota finale
         content = '\n'.join(lines)
         zf.writestr(filename, content)
 
 print(f"GT scritto: {out_zip}")
-print(f"Righe scartate per malformazione: {bad_lines_total}")
+print(f"Annotazioni scartate (malformate): {skipped_total}")
 
-# verifica approfondita
+# --- verifica approfondita ---
 print("\n--- Verifica ---")
 with zipfile.ZipFile(out_zip) as zf:
     names = zf.namelist()
@@ -66,23 +81,17 @@ with zipfile.ZipFile(out_zip) as zf:
     total_bad = 0
     for name in names:
         content = zf.read(name).decode('utf-8', errors='replace')
-        if not content:
-            continue  # file vuoto OK
         for line in content.split('\n'):
             line = line.strip()
             if not line:
                 continue
             parts = line.split(',####')
-            # deve avere esattamente 2 parti: coords e testo (anche vuoto)
-            if len(parts) != 2:
+            if len(parts) != 2 or len(parts[0].split(',')) < 6:
                 total_bad += 1
                 print(f"  MALFORMATA in {name}: '{line[:80]}'")
-                continue
-            coords_part = parts[0]
-            if not coords_part or len(coords_part.split(',')) < 6:
-                total_bad += 1
-                print(f"  COORDS MALFORMATE in {name}: '{line[:80]}'")
     print(f"Totale righe malformate nel zip: {total_bad}")
+    if total_bad == 0:
+        print("  \u2705 Tutte le righe sono valide")
 
     # mostra sample
     if names:
