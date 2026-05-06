@@ -22,21 +22,32 @@ with zipfile.ZipFile(out_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
 
             # salta se coordinate malformate
             if not seg or len(seg) % 2 != 0 or len(seg) < 6:
+                bad_lines_total += 1
                 continue
 
             coords  = ','.join(str(int(round(v))) for v in seg)
+
+            # salta se coords vuote o iniziano con virgola
+            if not coords or coords.startswith(','):
+                bad_lines_total += 1
+                continue
+
             text    = ann.get('text', '').strip().lower()
             ignored = ann.get('ignore', 0) == 1 or text == ''
 
             if ignored:
-                line = f"{coords},#######"
+                # righe ignorate: delimitatore #### con testo vuoto
+                # il parser si aspetta ptr[1] dopo split(',####') quindi
+                # il formato corretto e' coords,####
+                line = f"{coords},####"
             else:
-                line = f"{coords},####{text}"
-
-            # doppio controllo: la riga deve avere #### e coordinate non vuote
-            if '####' not in line or line.startswith(','):
-                bad_lines_total += 1
-                continue
+                # sanifica il testo: rimuovi caratteri che rompono il parsing
+                # il parser usa split(',####') quindi #### nel testo e' pericoloso
+                safe_text = text.replace('####', '').strip()
+                if safe_text == '':
+                    line = f"{coords},####"
+                else:
+                    line = f"{coords},####{safe_text}"
 
             lines.append(line)
 
@@ -59,14 +70,24 @@ with zipfile.ZipFile(out_zip) as zf:
             continue  # file vuoto OK
         for line in content.split('\n'):
             line = line.strip()
-            if line and '####' not in line:
+            if not line:
+                continue
+            parts = line.split(',####')
+            # deve avere esattamente 2 parti: coords e testo (anche vuoto)
+            if len(parts) != 2:
                 total_bad += 1
                 print(f"  MALFORMATA in {name}: '{line[:80]}'")
+                continue
+            coords_part = parts[0]
+            if not coords_part or len(coords_part.split(',')) < 6:
+                total_bad += 1
+                print(f"  COORDS MALFORMATE in {name}: '{line[:80]}'")
     print(f"Totale righe malformate nel zip: {total_bad}")
 
     # mostra sample
-    sample = names[0]
-    lines  = zf.read(sample).decode().split('\n')
-    print(f"\nSample {sample} ({len(lines)} righe):")
-    for l in lines[:5]:
-        print(f"  {l}")
+    if names:
+        sample = names[0]
+        lines_sample = zf.read(sample).decode().split('\n')
+        print(f"\nSample {sample} ({len(lines_sample)} righe):")
+        for l in lines_sample[:5]:
+            print(f"  {l}")
