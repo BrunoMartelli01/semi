@@ -1,0 +1,103 @@
+_BASE_: "../../Base_det.yaml"
+
+MODEL:
+  META_ARCHITECTURE: "TransformerPureDetectorV2"
+  # Usa il pretrain su IC17-MLT o su TotalText, a seconda di quale hai disponibile.
+  # Se hai già fatto il pretrain su TotalText, usa quello (trasferimento migliore).
+  # Se parti da zero su HierText, usa il pretrain generico ic17mlt.
+  WEIGHTS: "output/R50/150k_tt/pretrain/model_ts_final.pth"
+  TRANSFORMER:
+    LOSS:
+      USE_DYNAMIC_K: False
+      # Con 10% labeled, O2M_MATCH_NUM=5 (come TotalText 10s).
+      # Con 1% labeled usa 13, con 5% usa 7 — più labeled = meno candidati O2M
+      O2M_MATCH_NUM: 5
+      LEVEN_ALPHA: 20
+      COST_ALPHA: 20
+      ADP_POINT_COORD_WEIGHT: 1.0
+      ADP_POINT_TEXT_WEIGHT: 0.5
+      ADP_BOUNDARY_WEIGHT: 0.5
+      DET_ADAPTIVE_TYPE: 'edit_distance'
+
+INPUT:
+  ROTATE: False
+  # Valori per il training (stessi di TotalText come baseline)
+  MIN_SIZE_TRAIN: (640, 672, 704, 736, 768, 800)
+  MAX_SIZE_TRAIN: 1333
+  MIN_SIZE_TRAIN_SAMPLING: "choice"
+  # Valori per il test
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1200
+  # Crop disabilitato (HierText non usa crop aggressivo)
+  CROP:
+    ENABLED: False
+
+DATASETS:
+  # I nomi devono corrispondere ESATTAMENTE a quelli registrati in builtin.py
+  TRAIN: ("hiertext_train_10_label", "hiertext_train_10_unlabel")
+  TEST:  ("hiertext_test",)
+
+SOLVER:
+  # HierText ha ~74k immagini di train_images vs ~1255 di TotalText.
+  # Con un dataset molto più grande, MAX_ITER può restare 20000 (ogni iter
+  # vede già molti esempi grazie al batch più grande) oppure aumentarlo.
+  IMS_PER_BATCH: 2        # 4 labeled + 8 unlabeled (SOURCE_RATIO 1:2)
+  SOURCE_RATIO: (1, 1)     # 1 parte labeled : 2 parti unlabeled per batch
+  BASE_LR: 5e-5
+  LR_BACKBONE: 5e-6
+  WARMUP_ITERS: 0
+  STEPS: (8000,)         # nessun lr decay entro MAX_ITER
+  MAX_ITER: 12000
+  CHECKPOINT_PERIOD: 1000
+  FIND_UNUSED_PARAMETERS: True
+
+SSL:
+  MODE: "mean-teacher"
+  SEMI_WRAPPER: "SemiETSTextSpotter"
+
+  # Soglie di confidenza per i pseudo-label:
+  # - INITIAL: usata nelle prime STAGE_WARM_UP iterazioni (fase di warm-up)
+  # - FINAL: usata dopo il warm-up, quando il teacher è più affidabile
+  # HierText è un dataset denso con testi piccoli → soglia iniziale più bassa
+  PSEUDO_LABEL_INITIAL_SCORE_THR: 0.4
+  PSEUDO_LABEL_FINAL_SCORE_THR: 0.7
+
+  USE_SPOTTING_NMS: True        # NMS sui pseudo-label del teacher
+  USE_SEPERATE_MATCHER: False
+  USE_COMBINED_THR: False
+  O2M_TEXT_O2O: False
+  USE_O2M_ENC: False
+  MIN_PSEDO_BOX_SIZE: 0         # filtra box troppo piccole; 0 = nessun filtro
+
+  # Pesi delle loss semi-supervised
+  UNSUP_WEIGHT: 2.0             # peso della loss sugli unlabeled
+  CONSISTENCY_WEIGHT: 1.0
+
+  AUG_QUERY: False
+  INFERENCE_ON: "teacher"       # usa il teacher per fare inference a test_images time
+  STEP_HOOK: True
+
+  # WARM_UP: iterazioni iniziali in cui lo student si aggiorna solo su labeled
+  # (nessun pseudo-label). Con HierText, 1000 è sufficiente.
+  WARM_UP: 1000
+
+  # STAGE_WARM_UP: soglia di transizione tra INITIAL_THR e FINAL_THR.
+  # Dopo questa iterazione il teacher è abbastanza stabile da alzare la soglia.
+  STAGE_WARM_UP: 4000
+
+  EXTRA_STUDENT_INFO: True
+  USE_CONSISTENCY: False
+
+  EMA:
+    WARM_UP: 0                  # EMA attivo da subito (nessun warm-up EMA separato)
+
+  # Loss decoder per il branch supervised (labeled)
+  DECODER_LOSS: ["labels", "texts_psa", "ctrl_points", "bd_points"]
+  # Loss decoder per il branch semi-supervised (pseudo-label, o2o matching)
+  O2O_DECODER_LOSS: ["labels", "texts_adaptive_sci", "ctrl_points_adaptive_crc", "bd_points_adaptive_crc"]
+
+TEST:
+  EVAL_PERIOD: 1000
+  # valuta ogni 1000 iterazioni
+
+OUTPUT_DIR: "output/R50/hiertext/Finetune/semi_10s/SemiETS_10s"
