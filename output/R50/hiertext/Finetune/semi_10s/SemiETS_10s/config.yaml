@@ -2,7 +2,7 @@ CUDNN_BENCHMARK: false
 DATALOADER:
   ASPECT_RATIO_GROUPING: true
   FILTER_EMPTY_ANNOTATIONS: true
-  NUM_WORKERS: 8
+  NUM_WORKERS: 2
   REPEAT_THRESHOLD: 0.0
   SAMPLER_TRAIN: TrainingSampler
 DATASETS:
@@ -366,12 +366,12 @@ MODEL:
   ViTAEv2:
     DROP_PATH_RATE: 0.2
     TYPE: vitaev2_s
-  WEIGHTS: output/R50/hiertext/Finetune/semi_10s/SemiETS_10s/model_0001999.pth
+  WEIGHTS: output/R50/150k_tt/pretrain/model_ts_final.pth
 OUTPUT_DIR: output/R50/hiertext/Finetune/semi_10s/SemiETS_10s
 SEED: 42
 SOLVER:
   AMP:
-    ENABLED: false
+    ENABLED: true
   BASE_LR: 5.0e-05
   BIAS_LR_FACTOR: 1.0
   CHECKPOINT_PERIOD: 1000
