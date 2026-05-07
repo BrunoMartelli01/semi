@@ -4,7 +4,7 @@ import random
 CTLABELS = ['a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s',
             't','u','v','w','x','y','z','0','1','2','3','4','5','6','7','8','9']
 VOC_SIZE = 37
-PAD_TOKEN = VOC_SIZE - 1   # 36 = EOS/blank  ← MUST be VOC_SIZE-1, never VOC_SIZE
+PAD_TOKEN = VOC_SIZE - 1   # 36 = EOS/blank  <- MUST be VOC_SIZE-1, never VOC_SIZE
 
 def text_to_rec(text):
     MAX_LEN = 25
@@ -107,8 +107,8 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
     with open(out_json_path, "w") as f:
         json.dump(coco_clean, f)
 
-    print(f"Scritto {out_json_path}  →  {len(images)} immagini, {len(annotations_clean)} annotazioni valide")
-    print(f"Scritto {out_gt_source_path}  →  {len(annotations_all)} annotazioni totali ({len(annotations_all)-len(annotations_clean)} ignored)")
+    print(f"Scritto {out_json_path}  ->  {len(images)} immagini, {len(annotations_clean)} annotazioni valide")
+    print(f"Scritto {out_gt_source_path}  ->  {len(annotations_all)} annotazioni totali ({len(annotations_all)-len(annotations_clean)} ignored)")
     return images, annotations_all, annotations_clean
 
 
@@ -117,6 +117,10 @@ def make_semi_splits(images, annotations_all, label_ratio, out_dir,
     """
     Genera i JSON labeled/unlabeled per il training semi-supervised.
     label_ratio: frazione di immagini labeled (es. 0.10 per 10%)
+
+    - labeled   : mantiene il campo 'text' (utile per debug e supervision)
+    - unlabeled : rimuove 'text' (non disponibile in scenari semi-supervised reali)
+    Entrambi rimuovono 'ignore' e le annotazioni con ignore==1.
     """
     random.seed(seed)
     img_ids = [img["id"] for img in images]
@@ -129,14 +133,16 @@ def make_semi_splits(images, annotations_all, label_ratio, out_dir,
     for ann in annotations_all:
         ann_by_img.setdefault(ann["image_id"], []).append(ann)
 
-    def build_split(ids):
+    def build_split(ids, keep_text: bool):
         split_imgs = [img for img in images if img["id"] in ids]
         split_anns = []
+        # campi da escludere sempre
+        strip = {"ignore", "text"} if not keep_text else {"ignore"}
         for img in split_imgs:
             for ann in ann_by_img.get(img["id"], []):
                 if ann["ignore"] == 1:
                     continue
-                entry = {k: v for k, v in ann.items() if k not in ("ignore", "text")}
+                entry = {k: v for k, v in ann.items() if k not in strip}
                 split_anns.append(entry)
         return {"images": split_imgs, "annotations": split_anns,
                 "categories": [{"id": 1, "name": "text"}]}
@@ -148,40 +154,40 @@ def make_semi_splits(images, annotations_all, label_ratio, out_dir,
     unlabeled_path = f"{out_dir}/{split_name}_{ratio_str}_unlabeled.json"
 
     with open(labeled_path, "w") as f:
-        json.dump(build_split(labeled_ids), f)
+        json.dump(build_split(labeled_ids, keep_text=True), f)
     with open(unlabeled_path, "w") as f:
-        json.dump(build_split(unlabeled_ids), f)
+        json.dump(build_split(unlabeled_ids, keep_text=False), f)
 
-    print(f"  labeled   → {labeled_path}  ({len(labeled_ids)} img)")
-    print(f"  unlabeled → {unlabeled_path}  ({len(unlabeled_ids)} img)")
+    print(f"  labeled   -> {labeled_path}  ({len(labeled_ids)} img)")
+    print(f"  unlabeled -> {unlabeled_path}  ({len(unlabeled_ids)} img)")
 
 
 if __name__ == "__main__":
     BASE = "datasets/hiertext"
 
-    # ── 1. TEST / VALIDATION ────────────────────────────────────────────────
-    print("\n[1/3] Conversione validation → test.json")
+    # -- 1. TEST / VALIDATION --------------------------------------------------
+    print("\n[1/3] Conversione validation -> test.json")
     convert(
         jsonl_path         = f"{BASE}/validation.jsonl",
         out_json_path      = f"{BASE}/test.json",
         out_gt_source_path = f"{BASE}/test_gt_source.json",
     )
 
-    # ── 2. TRAINING COMPLETO ────────────────────────────────────────────────
-    print("\n[2/3] Conversione train → train_37voc.json")
+    # -- 2. TRAINING COMPLETO --------------------------------------------------
+    print("\n[2/3] Conversione train -> train_37voc.json")
     images, annotations_all, annotations_clean = convert(
         jsonl_path         = f"{BASE}/train.jsonl",
         out_json_path      = f"{BASE}/train_37voc.json",
         out_gt_source_path = f"{BASE}/train_gt_source.json",
     )
 
-    # ── 3. SPLIT SEMI-SUPERVISED ────────────────────────────────────────────
+    # -- 3. SPLIT SEMI-SUPERVISED ----------------------------------------------
     print("\n[3/3] Generazione split semi-supervised")
     for ratio in [0.05, 0.10, 0.20]:
         print(f"  ratio={ratio}")
         make_semi_splits(images, annotations_all, ratio, BASE)
 
-    # ── VERIFICA FINALE rec ─────────────────────────────────────────────────
+    # -- VERIFICA FINALE rec ---------------------------------------------------
     print("\n[VERIFICA] Controllo token rec in train_37voc.json ...")
     import numpy as np
     with open(f"{BASE}/train_37voc.json") as f:
@@ -190,4 +196,4 @@ if __name__ == "__main__":
     bad = (recs > PAD_TOKEN).sum()
     print(f"  Token > {PAD_TOKEN} (devono essere 0): {bad}")
     assert bad == 0, "ERRORE: ci sono ancora token fuori range!"
-    print("  ✅ Tutti i token rec sono nel range corretto [0, 36]")
+    print("  Tutti i token rec sono nel range corretto [0, 36]")
