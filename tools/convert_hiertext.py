@@ -3,20 +3,36 @@ import random
 
 CTLABELS = ['a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s',
             't','u','v','w','x','y','z','0','1','2','3','4','5','6','7','8','9']
-VOC_SIZE = 37
-PAD_TOKEN = VOC_SIZE - 1   # 36 = EOS/blank  <- MUST be VOC_SIZE-1, never VOC_SIZE
+# Vocabolario: 36 caratteri (indici 0-35)
+#   a-z  -> 0-25
+#   0-9  -> 26-35
+# Il padding/blank token è 37 (= VOC_SIZE), NON 36.
+# I modelli SemiETS/ABCNet si aspettano rec in [0,35] + pad=37 di lunghezza 25.
+VOC_SIZE  = 36          # numero di caratteri reali nel vocabolario
+PAD_TOKEN = 37          # token di padding (usato per riempire fino a MAX_LEN=25)
 
-def text_to_rec(text):
-    MAX_LEN = 25
+def text_to_rec(text, max_len=25):
+    """
+    Converte una stringa in una lista di interi lunga max_len.
+
+    Logica:
+      - ogni carattere alfanumerico (a-z, 0-9) viene mappato al suo indice in CTLABELS
+      - i caratteri non presenti in CTLABELS vengono ignorati
+      - la lista viene troncata a max_len e riempita con PAD_TOKEN (37)
+
+    Esempio:
+      'avon' -> [0, 21, 14, 13, 37, 37, ..., 37]  (25 elementi)
+    """
     rec = []
-    for c in text.lower():
+    for c in str(text).lower():
         if c in CTLABELS:
             rec.append(CTLABELS.index(c))
-    rec = rec[:MAX_LEN]
-    rec += [PAD_TOKEN] * (MAX_LEN - len(rec))
+    rec = rec[:max_len]
+    rec += [PAD_TOKEN] * (max_len - len(rec))
     assert all(0 <= t <= PAD_TOKEN for t in rec), \
         f"rec token out of range [0,{PAD_TOKEN}]: {rec}"
     return rec
+
 
 def lerp(a, b, t):
     return [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t]
@@ -39,6 +55,10 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                              (inclusi 'text' e 'ignore') - usato per eval/debug
       - out_json_path      : solo annotazioni valide (ignore==0),
                              con 'text' mantenuto (file di training supervisionato)
+
+    Formato rec generato:
+      lista di 25 interi in [0,35] per i caratteri + 37 come padding.
+      Esempio: 'hello' -> [7,4,11,11,14,37,37,...,37]
     """
     with open(jsonl_path) as f:
         data = json.load(f)
@@ -89,13 +109,13 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                         "id":           ann_id,
                         "image_id":     img_id,
                         "category_id":  1,
+                        "iscrowd":      0,
                         "bbox":         [x_min, y_min, w_box, h_box],
                         "area":         w_box * h_box,
                         "segmentation": [poly],
                         "bezier_pts":   bezier,
                         "rec":          rec,
                         "text":         text_orig.lower().strip(),
-                        "iscrowd":      0,
                         "ignore":       ignore,
                     })
                     ann_id += 1
