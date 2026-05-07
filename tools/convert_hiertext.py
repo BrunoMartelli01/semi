@@ -13,7 +13,7 @@ def text_to_rec(text):
         if c in CTLABELS:
             rec.append(CTLABELS.index(c))
     rec = rec[:MAX_LEN]
-    rec += [PAD_TOKEN] * (MAX_LEN - len(rec))   # padding with 36, not 37
+    rec += [PAD_TOKEN] * (MAX_LEN - len(rec))
     assert all(0 <= t <= PAD_TOKEN for t in rec), \
         f"rec token out of range [0,{PAD_TOKEN}]: {rec}"
     return rec
@@ -21,7 +21,25 @@ def text_to_rec(text):
 def lerp(a, b, t):
     return [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t]
 
+
+def _make_clean_ann(ann, keep_text: bool):
+    """
+    Restituisce una copia dell'annotazione pronta per il file loader:
+      - rimuove sempre 'ignore'
+      - rimuove 'text' solo se keep_text=False (file unlabeled)
+    """
+    strip = {"ignore"} if keep_text else {"ignore", "text"}
+    return {k: v for k, v in ann.items() if k not in strip}
+
+
 def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
+    """
+    Converte un file HierText JSONL in due file COCO:
+      - out_gt_source_path : tutte le annotazioni con tutti i campi
+                             (inclusi 'text' e 'ignore') - usato per eval/debug
+      - out_json_path      : solo annotazioni valide (ignore==0),
+                             con 'text' mantenuto (file di training supervisionato)
+    """
     with open(jsonl_path) as f:
         data = json.load(f)
 
@@ -82,34 +100,34 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     })
                     ann_id += 1
 
-    # --- file GT source: tutte le annotazioni (ignored incluse) ---
-    coco_full = {
+    # --- gt_source: tutte le annotazioni, tutti i campi (eval/debug) ---
+    coco_gt_source = {
         "images": images,
         "annotations": annotations_all,
         "categories": [{"id": 1, "name": "text"}]
     }
     with open(out_gt_source_path, "w") as f:
-        json.dump(coco_full, f)
+        json.dump(coco_gt_source, f)
 
-    # --- file loader: solo annotazioni valide, senza campi ignore/text ---
-    annotations_clean = []
-    for a in annotations_all:
-        if a["ignore"] == 1:
-            continue
-        entry = {k: v for k, v in a.items() if k not in ("ignore", "text")}
-        annotations_clean.append(entry)
-
-    coco_clean = {
+    # --- file loader supervisionato: valide + text mantenuto ---
+    annotations_supervised = [
+        _make_clean_ann(a, keep_text=True)
+        for a in annotations_all if a["ignore"] == 0
+    ]
+    coco_supervised = {
         "images": images,
-        "annotations": annotations_clean,
+        "annotations": annotations_supervised,
         "categories": [{"id": 1, "name": "text"}]
     }
     with open(out_json_path, "w") as f:
-        json.dump(coco_clean, f)
+        json.dump(coco_supervised, f)
 
-    print(f"Scritto {out_json_path}  ->  {len(images)} immagini, {len(annotations_clean)} annotazioni valide")
-    print(f"Scritto {out_gt_source_path}  ->  {len(annotations_all)} annotazioni totali ({len(annotations_all)-len(annotations_clean)} ignored)")
-    return images, annotations_all, annotations_clean
+    n_ignored = len(annotations_all) - len(annotations_supervised)
+    print(f"Scritto {out_json_path}")
+    print(f"  -> {len(images)} immagini, {len(annotations_supervised)} ann valide, {n_ignored} ignored")
+    print(f"Scritto {out_gt_source_path}")
+    print(f"  -> {len(annotations_all)} annotazioni totali (ignored incluse)")
+    return images, annotations_all, annotations_supervised
 
 
 def make_semi_splits(images, annotations_all, label_ratio, out_dir,
@@ -118,9 +136,10 @@ def make_semi_splits(images, annotations_all, label_ratio, out_dir,
     Genera i JSON labeled/unlabeled per il training semi-supervised.
     label_ratio: frazione di immagini labeled (es. 0.10 per 10%)
 
-    - labeled   : mantiene il campo 'text' (utile per debug e supervision)
-    - unlabeled : rimuove 'text' (non disponibile in scenari semi-supervised reali)
-    Entrambi rimuovono 'ignore' e le annotazioni con ignore==1.
+    Regola campi per tipo di file:
+      labeled   -> mantiene 'text' (supervisione esplicita, ground truth disponibile)
+      unlabeled -> rimuove 'text' (non disponibile nello scenario semi-supervised)
+    Entrambi: rimuovono 'ignore', escludono annotazioni con ignore==1.
     """
     random.seed(seed)
     img_ids = [img["id"] for img in images]
@@ -135,17 +154,17 @@ def make_semi_splits(images, annotations_all, label_ratio, out_dir,
 
     def build_split(ids, keep_text: bool):
         split_imgs = [img for img in images if img["id"] in ids]
-        split_anns = []
-        # campi da escludere sempre
-        strip = {"ignore", "text"} if not keep_text else {"ignore"}
-        for img in split_imgs:
-            for ann in ann_by_img.get(img["id"], []):
-                if ann["ignore"] == 1:
-                    continue
-                entry = {k: v for k, v in ann.items() if k not in strip}
-                split_anns.append(entry)
-        return {"images": split_imgs, "annotations": split_anns,
-                "categories": [{"id": 1, "name": "text"}]}
+        split_anns = [
+            _make_clean_ann(ann, keep_text=keep_text)
+            for img in split_imgs
+            for ann in ann_by_img.get(img["id"], [])
+            if ann["ignore"] == 0
+        ]
+        return {
+            "images": split_imgs,
+            "annotations": split_anns,
+            "categories": [{"id": 1, "name": "text"}]
+        }
 
     ratio_str = str(int(label_ratio * 100)) if label_ratio * 100 == int(label_ratio * 100) \
                 else str(label_ratio)
@@ -153,20 +172,25 @@ def make_semi_splits(images, annotations_all, label_ratio, out_dir,
     labeled_path   = f"{out_dir}/{split_name}_{ratio_str}_labeled.json"
     unlabeled_path = f"{out_dir}/{split_name}_{ratio_str}_unlabeled.json"
 
-    with open(labeled_path, "w") as f:
-        json.dump(build_split(labeled_ids, keep_text=True), f)
-    with open(unlabeled_path, "w") as f:
-        json.dump(build_split(unlabeled_ids, keep_text=False), f)
+    labeled_data   = build_split(labeled_ids,   keep_text=True)
+    unlabeled_data = build_split(unlabeled_ids, keep_text=False)
 
-    print(f"  labeled   -> {labeled_path}  ({len(labeled_ids)} img)")
-    print(f"  unlabeled -> {unlabeled_path}  ({len(unlabeled_ids)} img)")
+    with open(labeled_path, "w") as f:
+        json.dump(labeled_data, f)
+    with open(unlabeled_path, "w") as f:
+        json.dump(unlabeled_data, f)
+
+    print(f"  labeled   -> {labeled_path}")
+    print(f"              {len(labeled_ids)} img, {len(labeled_data['annotations'])} ann")
+    print(f"  unlabeled -> {unlabeled_path}")
+    print(f"              {len(unlabeled_ids)} img, {len(unlabeled_data['annotations'])} ann")
 
 
 if __name__ == "__main__":
     BASE = "datasets/hiertext"
 
     # -- 1. TEST / VALIDATION --------------------------------------------------
-    print("\n[1/3] Conversione validation -> test.json")
+    print("\n[1/3] Conversione validation -> test.json + test_gt_source.json")
     convert(
         jsonl_path         = f"{BASE}/validation.jsonl",
         out_json_path      = f"{BASE}/test.json",
@@ -174,8 +198,8 @@ if __name__ == "__main__":
     )
 
     # -- 2. TRAINING COMPLETO --------------------------------------------------
-    print("\n[2/3] Conversione train -> train_37voc.json")
-    images, annotations_all, annotations_clean = convert(
+    print("\n[2/3] Conversione train -> train_37voc.json + train_gt_source.json")
+    images, annotations_all, annotations_supervised = convert(
         jsonl_path         = f"{BASE}/train.jsonl",
         out_json_path      = f"{BASE}/train_37voc.json",
         out_gt_source_path = f"{BASE}/train_gt_source.json",
@@ -187,13 +211,27 @@ if __name__ == "__main__":
         print(f"  ratio={ratio}")
         make_semi_splits(images, annotations_all, ratio, BASE)
 
-    # -- VERIFICA FINALE rec ---------------------------------------------------
-    print("\n[VERIFICA] Controllo token rec in train_37voc.json ...")
+    # -- VERIFICA FINALE -------------------------------------------------------
+    print("\n[VERIFICA] Controllo coerenza file generati...")
     import numpy as np
-    with open(f"{BASE}/train_37voc.json") as f:
-        d = json.load(f)
-    recs = np.array([a["rec"] for a in d["annotations"]])
-    bad = (recs > PAD_TOKEN).sum()
-    print(f"  Token > {PAD_TOKEN} (devono essere 0): {bad}")
-    assert bad == 0, "ERRORE: ci sono ancora token fuori range!"
-    print("  Tutti i token rec sono nel range corretto [0, 36]")
+
+    checks = [
+        (f"{BASE}/train_37voc.json",             True,  "train_37voc (supervised)"),
+        (f"{BASE}/train_37voc_10_labeled.json",  True,  "10% labeled"),
+        (f"{BASE}/train_37voc_10_unlabeled.json",False, "10% unlabeled"),
+    ]
+    for path, expect_text, label in checks:
+        with open(path) as f:
+            d = json.load(f)
+        anns = d["annotations"]
+        recs  = np.array([a["rec"] for a in anns])
+        bad   = int((recs > PAD_TOKEN).sum())
+        has_text  = all("text" in a for a in anns)
+        has_ignore = any("ignore" in a for a in anns)
+        status = []
+        if bad > 0:              status.append(f"ERRORE: {bad} token rec > {PAD_TOKEN}")
+        if has_ignore:           status.append("ERRORE: campo 'ignore' presente")
+        if expect_text and not has_text:  status.append("ERRORE: 'text' mancante")
+        if not expect_text and has_text:  status.append("WARN: 'text' presente (inatteso)")
+        result = "OK" if not status else " | ".join(status)
+        print(f"  [{label}]  img={len(d['images'])}  ann={len(anns)}  -> {result}")
