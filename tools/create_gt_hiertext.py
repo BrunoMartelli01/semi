@@ -20,7 +20,8 @@ def make_gt_line(ann):
     if not coords or coords.startswith(','):
         return None
 
-    text    = ann.get('text', '').strip().lower()
+    # 96-voc: testo case-sensitive, nessun .lower()
+    text    = ann.get('text', '').strip()
     ignored = ann.get('ignore', 0) == 1 or text == ''
 
     if ignored:

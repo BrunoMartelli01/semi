@@ -1,42 +1,41 @@
 import json
 import random
 
-CTLABELS = ['a','b','c','d','e','f','g','h','i','j','k','l','m',
-            'n','o','p','q','r','s','t','u','v','w','x','y','z',
-            '0','1','2','3','4','5','6','7','8','9']
-# DeepSolo 37-voc convention:
-# - voc_size = 37
-# - valid character ids: 0..35 (36 symbols in CTLABELS)
-# - blank/unknown for CTC decoding: 36 (= voc_size - 1)
-# - dataset padding sentinel used in rec arrays: 37 (= voc_size_cfg in text.py)
-VOC_SIZE = 37
-BLANK_TOKEN = VOC_SIZE - 1   # 36
-PAD_TOKEN = VOC_SIZE         # 37
+# 96-voc convention (same as CTW1500 / SemiETS):
+# ASCII printable characters: ' ' (32) ... '~' (126)  -> 95 symbols
+# CTLABELS[i] = chr(i + 32)  for i in 0..94
+# blank/unknown for CTC decoding: 95 (= VOC_SIZE - 1)
+# dataset padding sentinel used in rec arrays: 96 (= VOC_SIZE)
+CTLABELS = [chr(i) for i in range(32, 127)]  # 95 printable ASCII chars
+assert len(CTLABELS) == 95
+
+VOC_SIZE = 96
+BLANK_TOKEN = VOC_SIZE - 1   # 95
+PAD_TOKEN = VOC_SIZE          # 96
 MAX_LEN = 25
 
 
 def text_to_rec(text, max_len=MAX_LEN):
     """
-    Encode text using DeepSolo 37-voc format.
+    Encode text using DeepSolo/SemiETS 96-voc format.
 
     Mapping:
-      a-z -> 0..25
-      0-9 -> 26..35
-      blank/unknown is reserved at 36 and is NOT written into GT rec
-      padding sentinel is 37
+      ASCII printable chars (space=32 ... ~=126) -> 0..94
+      blank/unknown is reserved at 95 and is NOT written into GT rec
+      padding sentinel is 96
 
-    Non-vocabulary characters are ignored.
-    Output length is fixed to max_len with PAD_TOKEN=37.
+    Characters outside the printable ASCII range are ignored.
+    Output length is fixed to max_len with PAD_TOKEN=96.
     """
     rec = []
-    for c in str(text).lower().strip():
+    for c in str(text).strip():
         if c in CTLABELS:
             rec.append(CTLABELS.index(c))
     rec = rec[:max_len]
     rec += [PAD_TOKEN] * (max_len - len(rec))
     assert len(rec) == max_len
     assert all((0 <= t < BLANK_TOKEN) or (t == PAD_TOKEN) for t in rec), \
-        f"invalid rec tokens for DeepSolo 37-voc: {rec}"
+        f"invalid rec tokens for DeepSolo 96-voc: {rec}"
     return rec
 
 
@@ -53,11 +52,11 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
     """
     Convert HierText annotations to the COCO-like format expected by DeepSolo/SemiETS.
 
-    Output rec format follows DeepSolo exactly:
-    - VOC_SIZE = 37
-    - characters occupy ids 0..35
-    - id 36 is reserved for CTC blank/unknown during decoding
-    - GT rec sequences are padded with 37 to fixed length 25
+    Output rec format follows SemiETS 96-voc (CTW1500) exactly:
+    - VOC_SIZE = 96
+    - characters occupy ids 0..94  (ASCII printable: space=0, ...~=94)
+    - id 95 is reserved for CTC blank/unknown during decoding
+    - GT rec sequences are padded with 96 to fixed length 25
     """
     with open(jsonl_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -101,13 +100,13 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     bot = [p3, lerp(p3, p2, 1/3), lerp(p3, p2, 2/3), p2]
                     bezier = [coord for p in top + bot for coord in p]
 
+                    # 96-voc: preserve original case (no .lower())
                     text_orig = str(word.get("text", ""))
                     legible = word.get("legible", True)
-                    text_norm = text_orig.lower().strip()
+                    text_norm = text_orig.strip()
                     rec = text_to_rec(text_norm)
 
-                    # Match DeepSolo dataset filtering convention: instances with no real text
-                    # after encoding are ignored. This happens when rec is entirely PAD_TOKEN.
+                    # instances with no real text after encoding are ignored
                     has_real_text = any(t != PAD_TOKEN for t in rec)
                     ignore = 1 if (not legible) or (not has_real_text) else 0
 
@@ -155,7 +154,7 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
 
 
 def make_semi_splits(images, annotations_all, label_ratio, out_dir,
-                     split_name="train_37voc", seed=42):
+                     split_name="train_96voc", seed=42):
     random.seed(seed)
     img_ids = [img["id"] for img in images]
     random.shuffle(img_ids)
@@ -210,10 +209,10 @@ if __name__ == "__main__":
         out_gt_source_path=f"{BASE}/test_gt_source.json",
     )
 
-    print("\n[2/3] Conversione train -> train_37voc.json + train_gt_source.json")
+    print("\n[2/3] Conversione train -> train_96voc.json + train_gt_source.json")
     images, annotations_all, annotations_supervised = convert(
         jsonl_path=f"{BASE}/train.jsonl",
-        out_json_path=f"{BASE}/train_37voc.json",
+        out_json_path=f"{BASE}/train_96voc.json",
         out_gt_source_path=f"{BASE}/train_gt_source.json",
     )
 
@@ -226,9 +225,9 @@ if __name__ == "__main__":
     import numpy as np
 
     checks = [
-        (f"{BASE}/train_37voc.json", True, "train_37voc (supervised)"),
-        (f"{BASE}/train_37voc_10_labeled.json", True, "10% labeled"),
-        (f"{BASE}/train_37voc_10_unlabeled.json", False, "10% unlabeled"),
+        (f"{BASE}/train_96voc.json", True, "train_96voc (supervised)"),
+        (f"{BASE}/train_96voc_10_labeled.json", True, "10% labeled"),
+        (f"{BASE}/train_96voc_10_unlabeled.json", False, "10% unlabeled"),
     ]
     for path, expect_text, label in checks:
         with open(path, 'r', encoding='utf-8') as f:
@@ -242,7 +241,7 @@ if __name__ == "__main__":
         all_pad_rows = int(np.sum(np.all(recs == PAD_TOKEN, axis=1))) if recs.size else 0
         status = []
         if bad > 0:
-            status.append(f"ERRORE: trovati token blank=36 nei GT ({bad})")
+            status.append(f"ERRORE: trovati token blank=95 nei GT ({bad})")
         if over > 0:
             status.append(f"ERRORE: {over} token rec > {PAD_TOKEN}")
         if has_ignore:
