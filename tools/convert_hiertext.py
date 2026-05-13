@@ -49,7 +49,7 @@ def text_to_rec(text, max_len=MAX_LEN):
     return rec
 
 
-def lerp(a, b, t):
+def _lerp(a, b, t):
     return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
 
 
@@ -82,6 +82,100 @@ def _vertices_to_pixels(verts, img_w, img_h):
         pts = pts_raw  # gia' in pixel
 
     return pts, is_normalized
+
+
+def _poly_to_bezier(pts):
+    """
+    Converte un poligono HierText (4+ vertici) in 8 punti di controllo
+    cubici di Bezier (16 valori float), seguendo ESATTAMENTE la convenzione
+    CTW1500:
+
+      bezier_pts = [TOP_p0, TOP_p1, TOP_p2, TOP_p3,
+                    BOT_p0, BOT_p1, BOT_p2, BOT_p3]
+
+    Convenzione CTW1500 (verificata su train_96voc_1_labeled.json):
+      - Curva TOP: dal vertice top-left (TL) al top-right (TR),
+                   da sinistra verso destra.
+      - Curva BOT: dal vertice bottom-right (BR) al bottom-left (BL),
+                   da destra verso sinistra.
+      - I punti di controllo interni (p1, p2) sono interpolati
+        linearmente a 1/3 e 2/3 del segmento (curva degenere = retta
+        per testo orizzontale, o spline approssimata per poligoni obliqui).
+
+    Per un poligono HierText con vertici [TL, TR, BR, BL] (ordine
+    in senso orario a partire dal top-left):
+      TL = pts[0], TR = pts[1], BR = pts[2], BL = pts[3]
+
+    Per poligoni con piu' di 4 vertici si usano il primo (TL), il secondo
+    (TR), il penultimo (BR) e l'ultimo (BL) come anchor points.
+    """
+    n = len(pts)
+
+    # Anchor points del poligono: TL, TR, BR, BL
+    TL = pts[0]
+    TR = pts[1]         if n >= 2 else pts[0]
+    BR = pts[n - 2]     if n >= 3 else pts[-1]
+    BL = pts[n - 1]
+
+    # Curva TOP: TL -> TR  (sinistra -> destra, margine superiore)
+    top_p0 = TL
+    top_p1 = _lerp(TL, TR, 1.0 / 3.0)
+    top_p2 = _lerp(TL, TR, 2.0 / 3.0)
+    top_p3 = TR
+
+    # Curva BOT: BR -> BL  (destra -> sinistra, margine inferiore)
+    # NOTA: in CTW1500 la curva bottom parte dal lato destro e torna
+    # al lato sinistro, formando un loop chiuso in senso antiorario.
+    bot_p0 = BR
+    bot_p1 = _lerp(BR, BL, 1.0 / 3.0)
+    bot_p2 = _lerp(BR, BL, 2.0 / 3.0)
+    bot_p3 = BL
+
+    bezier = [coord for p in [top_p0, top_p1, top_p2, top_p3,
+                               bot_p0, bot_p1, bot_p2, bot_p3]
+              for coord in p]
+    return bezier
+
+
+def _bezier_bbox(bezier, img_w=None, img_h=None):
+    """
+    Calcola il bbox XYWH a partire dagli 8 punti di controllo bezier,
+    identico alla procedura usata in CTW1500:
+
+      x_min = min di tutti gli x dei punti di controllo
+      y_min = min di tutti gli y dei punti di controllo
+      width  = max_x - x_min
+      height = max_y - y_min
+
+    CLIPPING: se y_min o x_min risultano negativi (punti fuori bordo
+    immagine), vengono clippati a 0, come verificato in CTW1500
+    (es. annotation id=4079, img 0541.jpg: y_ctrl=-16.43 -> y_min=0).
+    Il clipping si applica SOLO a x_min e y_min; width e height vengono
+    ricalcolati coerentemente dopo il clip.
+    """
+    xs = [bezier[i]     for i in range(0,  16, 2)]
+    ys = [bezier[i + 1] for i in range(0,  16, 2)]
+
+    x_min_raw = min(xs)
+    y_min_raw = min(ys)
+    x_max     = max(xs)
+    y_max     = max(ys)
+
+    # Clip ai bordi dell'immagine
+    x_min = max(0.0, x_min_raw)
+    y_min = max(0.0, y_min_raw)
+
+    if img_w is not None:
+        x_min = min(x_min, img_w)
+        x_max = min(x_max, img_w)
+    if img_h is not None:
+        y_min = min(y_min, img_h)
+        y_max = min(y_max, img_h)
+
+    w = max(0.0, x_max - x_min)
+    h = max(0.0, y_max - y_min)
+
+    return [round(x_min, 2), round(y_min, 2), round(w, 2), round(h, 2)]
 
 
 def _read_jsonl(jsonl_path):
@@ -128,8 +222,17 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
         "id": <int>,
         "bezier_pts": [x0,y0, x1,y1, ..., x7,y7],   # 8 punti = 16 valori
         "rec": [int * 100],                           # lunghezza 100, PAD=96
-        "bbox": [x_min, y_min, width, height]         # XYWH_ABS
+        "bbox": [x_min, y_min, width, height]         # XYWH_ABS, clippato a [0, img_wh]
       }
+
+    Struttura bezier_pts (convenzione CTW1500):
+      Punti 0-3: curva cubica TOP  (TL -> TR, da sinistra a destra)
+      Punti 4-7: curva cubica BOT  (BR -> BL, da destra a sinistra)
+      I punti di controllo interni sono interpolati linearmente a 1/3 e 2/3.
+
+    Struttura bbox (convenzione CTW1500):
+      Calcolata come min/max degli 8 punti di controllo bezier (NON dei
+      vertices originali), poi clippata a [0, img_w] x [0, img_h].
 
     Campi NON presenti (rimossi rispetto alla versione precedente):
       - "segmentation"  (non esiste in CTW1500)
@@ -178,23 +281,18 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     else:
                         n_absolute += 1
 
-                    xs = [p[0] for p in pts]
-                    ys = [p[1] for p in pts]
-                    x_min, y_min = min(xs), min(ys)
-                    x_max, y_max = max(xs), max(ys)
-                    # XYWH_ABS: width e height sono dimensioni, NON coordinate
-                    w_box = x_max - x_min
-                    h_box = y_max - y_min
+                    # --- bezier_pts: conversione corretta dal poligono ---
+                    # Segue la convenzione CTW1500:
+                    #   TOP curve: TL -> TR  (pts[0] -> pts[1])
+                    #   BOT curve: BR -> BL  (pts[-2] -> pts[-1])
+                    bezier = _poly_to_bezier(pts)
 
-                    # bezier_pts: 8 punti cubici di Bezier (top + bottom),
-                    # 16 valori float, identico a CTW1500
-                    p0 = pts[0]
-                    p1 = pts[1] if len(pts) > 1 else pts[0]
-                    p3 = pts[-1]
-                    p2 = pts[-2] if len(pts) > 2 else pts[-1]
-                    top = [p0, lerp(p0, p1, 1/3), lerp(p0, p1, 2/3), p1]
-                    bot = [p3, lerp(p3, p2, 1/3), lerp(p3, p2, 2/3), p2]
-                    bezier = [coord for p in top + bot for coord in p]
+                    # --- bbox: min/max sugli 8 punti di controllo bezier, clippato ---
+                    # Identico alla procedura CTW1500 (verificata su train_96voc_1_labeled.json)
+                    bbox = _bezier_bbox(bezier,
+                                        img_w=img_w if img_w > 0 else None,
+                                        img_h=img_h if img_h > 0 else None)
+                    x_min, y_min, w_box, h_box = bbox
 
                     # 96-voc rec con MAX_LEN=100 (come CTW1500)
                     text_orig = str(word.get("text", ""))
@@ -208,6 +306,7 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     if w_box <= 0 or h_box <= 0:
                         ignore = 1
 
+                    # area calcolata sulla bbox clippata (evita valori negativi)
                     area = round(w_box * h_box, 1) if w_box > 0 and h_box > 0 else 0.0
 
                     # Annotazione nel formato CTW1500 esatto.
@@ -221,8 +320,7 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                         "id": ann_id,
                         "bezier_pts": bezier,
                         "rec": rec,
-                        "bbox": [round(x_min, 2), round(y_min, 2),
-                                 round(w_box, 2), round(h_box, 2)],
+                        "bbox": bbox,
                         # campi interni (rimossi al momento della scrittura)
                         "_ignore": ignore,
                         "_text": text_norm,
@@ -234,8 +332,7 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                         bbox_samples.append({
                             "img": fname, "img_wh": (img_w, img_h),
                             "was_normalized": was_normalized,
-                            "bbox_xywh": [round(x_min, 2), round(y_min, 2),
-                                          round(w_box, 2), round(h_box, 2)],
+                            "bbox_xywh": bbox,
                         })
 
     # --- sanity check a schermo ---
@@ -386,8 +483,12 @@ if __name__ == "__main__":
 
         bboxes = np.array([a["bbox"] for a in anns]) if anns else np.zeros((0, 4))
         bad_bbox = int(np.sum((bboxes[:, 2] <= 0) | (bboxes[:, 3] <= 0))) if bboxes.size else 0
+        neg_bbox = int(np.sum((bboxes[:, 0] < 0) | (bboxes[:, 1] < 0))) if bboxes.size else 0
         mean_w = float(np.mean(bboxes[:, 2])) if bboxes.size else 0.0
         mean_h = float(np.mean(bboxes[:, 3])) if bboxes.size else 0.0
+
+        bez_lens = [len(a["bezier_pts"]) for a in anns] if anns else []
+        wrong_bez = sum(1 for l in bez_lens if l != 16)
 
         status = []
         if bad > 0:
@@ -406,10 +507,12 @@ if __name__ == "__main__":
             status.append(f"ERRORE: {all_pad_rows} istanze con rec tutto padding")
         if bad_bbox > 0:
             status.append(f"ERRORE: {bad_bbox} bbox con w<=0 o h<=0")
+        if neg_bbox > 0:
+            status.append(f"ERRORE: {neg_bbox} bbox con x_min<0 o y_min<0 (clip mancante)")
         if wrong_rec_len > 0:
             status.append(f"ERRORE: {wrong_rec_len} rec con lunghezza != {MAX_LEN}")
-        if mean_w > 300 or mean_h > 300:
-            status.append(f"WARN: bbox media molto grande (mean_w={mean_w:.1f}, mean_h={mean_h:.1f})")
+        if wrong_bez > 0:
+            status.append(f"ERRORE: {wrong_bez} bezier_pts con lunghezza != 16")
 
         result = "OK" if not status else " | ".join(status)
         print(f"  [{label}]  img={len(d['images'])}  ann={len(anns)}  "
