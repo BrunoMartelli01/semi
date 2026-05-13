@@ -212,6 +212,23 @@ class SemiETSTextSpotter(MultiStreamSpotter):
                 self.teacher.use_o2m = False
 
         loss = {}
+
+        # ── print bbox GT durante warmup ──────────────────────────────────
+        is_warmup = self.curr_step < self.label_warm_up
+        if is_warmup and 'sup' in input_dict and self.curr_step % 50 == 0:
+            print(f"\n[Step {self.curr_step}] *** WARMUP (step < {self.label_warm_up}) — GT bboxes ***")
+            for i, x in enumerate(input_dict['sup']):
+                instances = x["instances"]
+                n = len(instances)
+                print(f"  [Image {i}] #gt_instances={n}")
+                if instances.has("gt_boxes"):
+                    for j, box in enumerate(instances.gt_boxes.tensor):
+                        print(f"    gt_box[{j}]: {box.tolist()}")
+                if instances.has("bd_points"):
+                    for j, bd in enumerate(instances.bd_points):
+                        print(f"    gt_bd[{j}]: {bd.tolist()}")
+        # ──────────────────────────────────────────────────────────────────
+
         # forward the labeled data
         if 'sup' in input_dict:
             label_loss_dict = self.student.forward(input_dict['sup'])
@@ -711,6 +728,19 @@ class SemiETSTextSpotter(MultiStreamSpotter):
             pseudo_labels.append(pseudo_labels_per_image)
 
         teacher_info['pseudo_labels'] = pseudo_labels
+
+        # ── print pseudo-bbox del teacher durante il training ─────────────
+        if self.curr_step % 50 == 0:
+            print(f"\n[Step {self.curr_step}] *** TRAINING — Teacher pseudo-labels ***")
+            for i, pl in enumerate(pseudo_labels):
+                labels_pl = pl.get('labels', None)
+                bd_pl = pl.get('bd_points', None)
+                n = len(labels_pl) if labels_pl is not None else 0
+                print(f"  [Image {i}] #pseudo_instances={n}")
+                if bd_pl is not None:
+                    for j in range(n):
+                        print(f"    pseudo_bd[{j}]: {bd_pl[j].tolist()}")
+        # ──────────────────────────────────────────────────────────────────
 
         # get the transform matrix to convert the pseudo labels (described by points)
         teacher_info["transform_matrix"] = [
