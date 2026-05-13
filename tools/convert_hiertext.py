@@ -48,9 +48,44 @@ def _make_clean_ann(ann, keep_text: bool):
     return {k: v for k, v in ann.items() if k not in strip}
 
 
+def _vertices_to_pixels(verts, img_w, img_h):
+    """
+    HierText vertices possono essere:
+      - normalizzati in [0, 1]  -> moltiplicare per img_w / img_h
+      - gia' in pixel assoluti  -> usare direttamente
+
+    La distinzione e' semplice: se tutti i valori x e y sono <= 1.0
+    (con un piccolo margine per floating point) le coordinate sono
+    normalizzate; altrimenti sono gia' in pixel.
+
+    Restituisce una lista di [x_px, y_px] in pixel assoluti float.
+    """
+    if isinstance(verts[0], dict):
+        pts_raw = [[v["x"], v["y"]] for v in verts]
+    else:
+        pts_raw = [[v[0], v[1]] for v in verts]
+
+    xs_raw = [p[0] for p in pts_raw]
+    ys_raw = [p[1] for p in pts_raw]
+
+    # Se tutti i valori sono in [0, 1] le coordinate sono normalizzate
+    is_normalized = (max(xs_raw) <= 1.0 + 1e-6) and (max(ys_raw) <= 1.0 + 1e-6)
+
+    if is_normalized:
+        pts = [[p[0] * img_w, p[1] * img_h] for p in pts_raw]
+    else:
+        pts = pts_raw  # gia' in pixel
+
+    return pts, is_normalized
+
+
 def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
     """
     Convert HierText annotations to the COCO-like format expected by DeepSolo/SemiETS.
+
+    Le bbox vengono salvate in formato XYWH_ABS (x_min, y_min, width, height)
+    in pixel assoluti, coerente con bbox_mode=BoxMode.XYWH_ABS usato in
+    adet/data/datasets/text.py.
 
     Output rec format follows SemiETS 96-voc (CTW1500) exactly:
     - VOC_SIZE = 96
@@ -63,14 +98,19 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
 
     images, annotations_all = [], []
     ann_id = 1
+    n_normalized = 0
+    n_absolute = 0
+    bbox_samples = []  # per sanity check
 
     for img_id, sample in enumerate(data["annotations"]):
         fname = sample['image_id'] + img_suffix
+        img_w = sample.get("image_width", 0)
+        img_h = sample.get("image_height", 0)
         images.append({
             "id": img_id,
             "file_name": fname,
-            "width": sample.get("image_width", 0),
-            "height": sample.get("image_height", 0),
+            "width": img_w,
+            "height": img_h,
         })
 
         for para in sample.get("paragraphs", []):
@@ -80,16 +120,20 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     if len(verts) < 3:
                         continue
 
-                    if isinstance(verts[0], dict):
-                        pts = [[v["x"], v["y"]] for v in verts]
+                    # --- converti vertices in pixel assoluti ---
+                    pts, was_normalized = _vertices_to_pixels(verts, img_w, img_h)
+                    if was_normalized:
+                        n_normalized += 1
                     else:
-                        pts = [[v[0], v[1]] for v in verts]
+                        n_absolute += 1
 
                     xs = [p[0] for p in pts]
                     ys = [p[1] for p in pts]
                     x_min, y_min = min(xs), min(ys)
-                    w_box = max(xs) - x_min
-                    h_box = max(ys) - y_min
+                    x_max, y_max = max(xs), max(ys)
+                    # XYWH_ABS: width e height sono dimensioni, NON coordinate
+                    w_box = x_max - x_min
+                    h_box = y_max - y_min
                     poly = [coord for p in pts for coord in p]
 
                     p0 = pts[0]
@@ -106,14 +150,19 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     text_norm = text_orig.strip()
                     rec = text_to_rec(text_norm)
 
-                    # instances with no real text after encoding are ignored
+                    # instances con nessun testo reale dopo encoding vengono ignorate
                     has_real_text = any(t != PAD_TOKEN for t in rec)
                     ignore = 1 if (not legible) or (not has_real_text) else 0
 
-                    annotations_all.append({
+                    # bbox sanity check: w e h devono essere > 0
+                    if w_box <= 0 or h_box <= 0:
+                        ignore = 1
+
+                    ann = {
                         "id": ann_id,
                         "image_id": img_id,
                         "category_id": 1,
+                        # XYWH_ABS: [x_min, y_min, width, height] in pixel assoluti
                         "bbox": [x_min, y_min, w_box, h_box],
                         "area": w_box * h_box,
                         "segmentation": [poly],
@@ -122,8 +171,27 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                         "text": text_norm,
                         "iscrowd": 0,
                         "ignore": ignore,
-                    })
+                    }
+                    annotations_all.append(ann)
                     ann_id += 1
+
+                    if len(bbox_samples) < 5:
+                        bbox_samples.append({
+                            "img": fname, "img_wh": (img_w, img_h),
+                            "was_normalized": was_normalized,
+                            "bbox_xywh": [round(x_min,2), round(y_min,2), round(w_box,2), round(h_box,2)],
+                            "bbox_xyxy_check": [round(x_min,2), round(y_min,2), round(x_max,2), round(y_max,2)],
+                        })
+
+    # --- sanity check a schermo ---
+    print(f"\n[SANITY CHECK bbox] vertices normalizzati={n_normalized}, gia' in pixel={n_absolute}")
+    print("Prime 5 bbox (formato XYWH salvato nel JSON):")
+    for s in bbox_samples:
+        print(f"  img={s['img']} ({s['img_wh'][0]}x{s['img_wh'][1]}) "
+              f"normalized={s['was_normalized']} "
+              f"bbox_xywh={s['bbox_xywh']} "
+              f"-> xyxy_atteso={s['bbox_xyxy_check']}")
+    print()
 
     coco_gt_source = {
         "images": images,
@@ -239,6 +307,20 @@ if __name__ == "__main__":
         has_text = all("text" in a for a in anns) if anns else True
         has_ignore = any("ignore" in a for a in anns) if anns else False
         all_pad_rows = int(np.sum(np.all(recs == PAD_TOKEN, axis=1))) if recs.size else 0
+
+        # Verifica bbox: w e h devono essere > 0 per ogni annotazione
+        bboxes = np.array([a["bbox"] for a in anns]) if anns else np.zeros((0, 4))
+        bad_bbox = int(np.sum((bboxes[:, 2] <= 0) | (bboxes[:, 3] <= 0))) if bboxes.size else 0
+        # Verifica che le bbox siano in XYWH e non XYXY (w e h devono essere << img size)
+        # Una bbox in XYXY avrebbe x2 > x1 con valori tipicamente > 100px
+        # Una bbox in XYWH avrebbe w = x2-x1 (dimensione reale, piu' piccola)
+        # Avvisiamo se la bbox media sembra troppo grande (possibile errore XYXY)
+        if bboxes.size:
+            mean_w = float(np.mean(bboxes[:, 2]))
+            mean_h = float(np.mean(bboxes[:, 3]))
+        else:
+            mean_w = mean_h = 0.0
+
         status = []
         if bad > 0:
             status.append(f"ERRORE: trovati token blank=95 nei GT ({bad})")
@@ -252,5 +334,11 @@ if __name__ == "__main__":
             status.append("WARN: 'text' presente (inatteso)")
         if all_pad_rows > 0:
             status.append(f"ERRORE: {all_pad_rows} istanze con rec tutto padding")
+        if bad_bbox > 0:
+            status.append(f"ERRORE: {bad_bbox} bbox con w<=0 o h<=0")
+        if mean_w > 300 or mean_h > 300:
+            status.append(f"WARN: bbox media molto grande (mean_w={mean_w:.1f}, mean_h={mean_h:.1f}) -- possibile XYXY invece di XYWH?")
+
         result = "OK" if not status else " | ".join(status)
-        print(f"  [{label}]  img={len(d['images'])}  ann={len(anns)}  -> {result}")
+        print(f"  [{label}]  img={len(d['images'])}  ann={len(anns)}  "
+              f"bbox_mean=[w={mean_w:.1f}, h={mean_h:.1f}]  -> {result}")

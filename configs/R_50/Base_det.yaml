@@ -47,6 +47,8 @@ SOLVER:
     CLIP_TYPE: "full_model"
     CLIP_VALUE: 0.1
     NORM_TYPE: 2.0
+  AMP:
+    ENABLED: true
 
 INPUT:
   HFLIP_TRAIN: False

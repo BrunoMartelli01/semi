@@ -5,7 +5,7 @@ MODEL:
   # Usa il pretrain su TotalText o IC17-MLT convertito a 96-voc.
   # Se parti da un checkpoint 37-voc, riaddestra il recognizer head prima di
   # usare questo config (VOC_SIZE diverso rende il rec head incompatibile).
-  WEIGHTS: "output/R50/150k_tt/pretrain/model_ts_final.pth"
+  WEIGHTS: "output/R50/150k/pretrain/model_ts_96_final.pth"
   TRANSFORMER:
     VOC_SIZE: 96          # 95 caratteri ASCII stampabili + 1 blank token
     LOSS:
@@ -45,8 +45,6 @@ SOLVER:
   MAX_ITER: 15000
   CHECKPOINT_PERIOD: 1000
   FIND_UNUSED_PARAMETERS: True
-  AMP:
-    ENABLED: True
 
 SSL:
   MODE: "mean-teacher"
