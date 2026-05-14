@@ -23,15 +23,12 @@ MODEL:
       DET_ADAPTIVE_TYPE: 'edit_distance'
 
 
+
 INPUT:
   ROTATE: False
-  MIN_SIZE_TEST: 800
-  MAX_SIZE_TEST: 1000
-  MIN_SIZE_TRAIN: (480, 576, 672, 768, 864)   # era 14 scale tra 480 e 896
-  MAX_SIZE_TRAIN: 1400                          # era 1600
-  CROP:
-    ENABLED: True
-    CROP_INSTANCE: False
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1200
+
 
 DATASETS:
   # I nomi corrispondono ESATTAMENTE alle entries 96-voc in builtin.py

@@ -1,7 +1,7 @@
 import json
 import math
 import random
-
+import numpy as np
 # 96-voc convention (same as CTW1500 / SemiETS):
 # ASCII printable characters: ' ' (32) ... '~' (126)  -> 95 symbols
 # CTLABELS[i] = chr(i + 32)  for i in 0..94
