@@ -498,7 +498,7 @@ if __name__ == "__main__":
     )
 
     print("\n[3/3] Generazione split semi-supervised")
-    for ratio in [0.05, 0.10, 0.20, 0.50, 1.00]:
+    for ratio in [0.005, 0.010, 0.020, 0.050, 0.10]:
         print(f"  ratio={ratio}")
         make_semi_splits(images, annotations_all, ratio, BASE)
 
