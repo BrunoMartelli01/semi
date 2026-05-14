@@ -84,6 +84,34 @@ def _vertices_to_pixels(verts, img_w, img_h):
     return pts, is_normalized
 
 
+def _reorder_quad(pts):
+    """
+    Riordina 4 vertici di un quadrilatero in [TL, TR, BR, BL] garantendo
+    che la curva TOP vada da sinistra a destra (TL->TR) e la curva BOT
+    torni da destra a sinistra (BR->BL).
+
+    Questo previene la self-intersection del ring bezier quando lo
+    strumento di validazione ricostruisce il contorno come:
+      ring = TOP_curve + BOT_curve + chiusura
+
+    HierText puo' fornire i vertici in ordine arbitrario (orario,
+    antiorario, o partendo da un angolo diverso da TL). Questa funzione
+    normalizza sempre a [TL, TR, BR, BL] basandosi sulle coordinate y:
+      - I due punti con y MINORE (piu' in ALTO) formano il TOP edge
+      - I due punti con y MAGGIORE (piu' in BASSO) formano il BOT edge
+      - Dentro ogni coppia si ordina per x crescente (sinistra -> destra)
+
+    Funziona per rettangoli, parallelogrammi e quadrilateri obliqui generici.
+    """
+    # Ordina per y crescente (y minore = piu' in alto in coordinate immagine)
+    by_y = sorted(pts, key=lambda p: p[1])
+    top_two = sorted(by_y[:2], key=lambda p: p[0])   # i due piu' in alto, da sx a dx
+    bot_two = sorted(by_y[2:], key=lambda p: p[0])   # i due piu' in basso, da sx a dx
+    TL, TR = top_two[0], top_two[1]
+    BL, BR = bot_two[0], bot_two[1]
+    return [TL, TR, BR, BL]
+
+
 def _poly_to_bezier(pts):
     """
     Converte un poligono HierText (4+ vertici) in 8 punti di controllo
@@ -102,20 +130,32 @@ def _poly_to_bezier(pts):
         linearmente a 1/3 e 2/3 del segmento (curva degenere = retta
         per testo orizzontale, o spline approssimata per poligoni obliqui).
 
-    Per un poligono HierText con vertici [TL, TR, BR, BL] (ordine
-    in senso orario a partire dal top-left):
-      TL = pts[0], TR = pts[1], BR = pts[2], BL = pts[3]
+    FIX self-intersection (rispetto alla versione precedente):
+      I vertici vengono riordinati in [TL, TR, BR, BL] prima di estrarre
+      gli anchor points. Questo garantisce che la curva TOP vada sempre
+      da sinistra a destra e la curva BOT da destra a sinistra, evitando
+      che il ring chiuso si auto-interseca quando HierText fornisce i
+      vertici in ordine non-standard (antiorario, ruotato, ecc.).
 
-    Per poligoni con piu' di 4 vertici si usano il primo (TL), il secondo
-    (TR), il penultimo (BR) e l'ultimo (BL) come anchor points.
+      Per poligoni con piu' di 4 vertici si individuano i 4 anchor points
+      separando i punti per y (top half / bottom half) e poi per x.
     """
     n = len(pts)
 
-    # Anchor points del poligono: TL, TR, BR, BL
-    TL = pts[0]
-    TR = pts[1]         if n >= 2 else pts[0]
-    BR = pts[n - 2]     if n >= 3 else pts[-1]
-    BL = pts[n - 1]
+    if n == 4:
+        # Riordina sempre in [TL, TR, BR, BL] indipendentemente dall'ordine originale
+        ordered = _reorder_quad(pts)
+        TL, TR, BR, BL = ordered[0], ordered[1], ordered[2], ordered[3]
+    else:
+        # Poligono con >4 vertici: separa top-edge e bottom-edge per y
+        half = max(2, n // 2)
+        by_y = sorted(pts, key=lambda p: p[1])
+        top_pts = sorted(by_y[:half], key=lambda p: p[0])
+        bot_pts = sorted(by_y[-half:], key=lambda p: p[0])
+        TL = top_pts[0]   # top-left:    min x tra i top
+        TR = top_pts[-1]  # top-right:   max x tra i top
+        BL = bot_pts[0]   # bottom-left: min x tra i bot
+        BR = bot_pts[-1]  # bottom-right: max x tra i bot
 
     # Curva TOP: TL -> TR  (sinistra -> destra, margine superiore)
     top_p0 = TL
@@ -229,6 +269,8 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
       Punti 0-3: curva cubica TOP  (TL -> TR, da sinistra a destra)
       Punti 4-7: curva cubica BOT  (BR -> BL, da destra a sinistra)
       I punti di controllo interni sono interpolati linearmente a 1/3 e 2/3.
+      I vertici vengono SEMPRE riordinati in [TL, TR, BR, BL] per prevenire
+      self-intersection nel ring bezier (fix rispetto alla versione precedente).
 
     Struttura bbox (convenzione CTW1500):
       Calcolata come min/max degli 8 punti di controllo bezier (NON dei
@@ -281,10 +323,10 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     else:
                         n_absolute += 1
 
-                    # --- bezier_pts: conversione corretta dal poligono ---
-                    # Segue la convenzione CTW1500:
-                    #   TOP curve: TL -> TR  (pts[0] -> pts[1])
-                    #   BOT curve: BR -> BL  (pts[-2] -> pts[-1])
+                    # --- bezier_pts: vertici riordinati in [TL,TR,BR,BL] ---
+                    # I vertici vengono riordinati prima di estrarre gli anchor points,
+                    # prevenendo la self-intersection del ring bezier quando HierText
+                    # fornisce i vertici in ordine non-standard (antiorario, ruotato, ecc.)
                     bezier = _poly_to_bezier(pts)
 
                     # --- bbox: min/max sugli 8 punti di controllo bezier, clippato ---
@@ -456,7 +498,7 @@ if __name__ == "__main__":
     )
 
     print("\n[3/3] Generazione split semi-supervised")
-    for ratio in [0.01, 0.02, 0.05, 0.10, 0.20, 0.50]:
+    for ratio in [0.05, 0.10, 0.20, 0.50, 1.00]:
         print(f"  ratio={ratio}")
         make_semi_splits(images, annotations_all, ratio, BASE)
 
@@ -464,7 +506,7 @@ if __name__ == "__main__":
     import numpy as np
 
     checks = [
-        (f"{BASE}/train_96voc.json", True, "train_96voc (supervised)"),
+        (f"{BASE}/train_96voc.json", False, "train_96voc (supervised)"),
         (f"{BASE}/train_96voc_10_labeled.json", True, "10% labeled"),
         (f"{BASE}/train_96voc_10_unlabeled.json", False, "10% unlabeled"),
     ]
