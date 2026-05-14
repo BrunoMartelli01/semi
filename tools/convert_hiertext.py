@@ -561,10 +561,10 @@ def make_semi_splits(images, annotations_all, label_ratio, out_dir,
             "annotations": split_anns,
             "categories": CATEGORIES,
         }
-
-    ratio_str = (str(int(label_ratio * 100))
-                 if label_ratio * 100 == int(label_ratio * 100)
-                 else str(label_ratio))
+    if label_ratio * 100>= 1:
+        ratio_str = str(int(label_ratio*100))
+    else:
+        ratio_str = str(label_ratio*100)
 
     labeled_path = f"{out_dir}/{split_name}_{ratio_str}_labeled.json"
     unlabeled_path = f"{out_dir}/{split_name}_{ratio_str}_unlabeled.json"
