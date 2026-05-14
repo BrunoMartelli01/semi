@@ -29,6 +29,13 @@ bounding box della parola. Per ogni istanza:
   - in caso di fallimento si usa il convex_hull del poligono originale
     come fallback deterministico
 
+Formati di input supportati:
+  - .json               : JSON completo { "annotations": [...] }  (formato Google ufficiale)
+  - .jsonl              : stesso formato .json ma con estensione diversa (Google lo chiama cosi)
+  - .jsonl  (vero JSONL): un oggetto JSON per riga (un'immagine per riga)
+  - .jsonl.gz / .gz     : versione compressa del vero JSONL
+  Lo script detecta automaticamente il formato leggendo il primo byte.
+
 Vocabolari supportati:
   - 37  : a-z + cifre + illeggibile (indice 36)
   - 96  : ASCII 32-127 (95 char) + illeggibile (indice 95)
@@ -225,7 +232,7 @@ def bezier_from_polygon(vertices, num_pts=25):
                              [xmax, ymax], [xmin, ymax]])
         cp_top, cp_bot, valid = _try(bbox_pts)
         if not valid:
-            log.warning("Fallback bbox ha generato self-intersection: poligono degenere, scartato")
+            log.warning("Fallback bbox: poligono degenere, scartato")
             return None, False
 
     return cp_top.flatten().tolist() + cp_bot.flatten().tolist(), valid
@@ -234,31 +241,80 @@ def bezier_from_polygon(vertices, num_pts=25):
 # ---------------------------------------------------------------------------
 # Parsing annotazioni HierText
 # ---------------------------------------------------------------------------
-def open_jsonl(path):
-    path = str(path)
-    opener = gzip.open(path, "rt", encoding="utf-8") if path.endswith(".gz") else open(path, "r", encoding="utf-8")
+def _read_jsonl_lines(path_str):
+    """Legge un file testo riga per riga come JSONL (un oggetto per riga)."""
+    opener = (gzip.open(path_str, "rt", encoding="utf-8")
+              if path_str.endswith(".gz")
+              else open(path_str, "r", encoding="utf-8"))
+    results = []
     with opener as f:
         for line in f:
             line = line.strip()
             if line:
-                yield json.loads(line)
+                results.append(json.loads(line))
+    return results
 
 
 def parse_hiertext(input_path):
     """
-    Legge annotazioni HierText.
-    Supporta .jsonl, .jsonl.gz (un dict/riga = un'immagine)
-    e .json (formato Google ufficiale con chiave "annotations").
+    Legge annotazioni HierText con auto-detection del formato.
+
+    Google distribuisce i file come .jsonl ma in realta sono JSON completi
+    con struttura {"annotations": [...]} -- NON vero JSONL (un oggetto/riga).
+    Questa funzione gestisce entrambi i casi:
+
+      Caso A - JSON completo (file inizia con '{'):
+        Carica con json.load e ritorna data["annotations"].
+        Questo e il formato di train.jsonl e validation.jsonl ufficiali.
+
+      Caso B - Vero JSONL (file inizia con '[' o primo char non e '{'):
+        Legge riga per riga, ogni riga e un dict immagine.
+
+      Caso C - .gz:
+        Apre con gzip e applica lo stesso auto-detect.
     """
     input_path = Path(input_path)
-    if input_path.suffix in (".gz", ".jsonl") or str(input_path).endswith(".jsonl.gz"):
-        return list(open_jsonl(input_path))
-    elif input_path.suffix == ".json":
-        with open(input_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("annotations", data)
+    path_str = str(input_path)
+
+    # Leggi il primo carattere non-whitespace per capire il formato
+    if path_str.endswith(".gz"):
+        with gzip.open(path_str, "rt", encoding="utf-8") as f:
+            first_char = ""
+            for ch in f.read(4096):
+                if ch.strip():
+                    first_char = ch
+                    break
     else:
-        raise ValueError(f"Formato non supportato: {input_path.suffix}")
+        with open(path_str, "r", encoding="utf-8") as f:
+            first_char = ""
+            for ch in f.read(4096):
+                if ch.strip():
+                    first_char = ch
+                    break
+
+    log.info(f"Formato rilevato: primo carattere = '{first_char}' in {input_path.name}")
+
+    if first_char == "{":
+        # Caso A: JSON completo con {"annotations": [...]}
+        log.info("Modalita: JSON completo (formato Google ufficiale)")
+        if path_str.endswith(".gz"):
+            with gzip.open(path_str, "rt", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            with open(path_str, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        records = data.get("annotations", [])
+        if not records:
+            # Potrebbe essere un dict singolo di un'immagine
+            records = [data]
+        log.info(f"  Record (immagini) trovati: {len(records)}")
+        return records
+    else:
+        # Caso B: vero JSONL, un oggetto per riga
+        log.info("Modalita: JSONL (un oggetto per riga)")
+        records = _read_jsonl_lines(path_str)
+        log.info(f"  Record (immagini) trovati: {len(records)}")
+        return records
 
 
 # ---------------------------------------------------------------------------
