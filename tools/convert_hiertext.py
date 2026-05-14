@@ -1,4 +1,5 @@
 import json
+import math
 import random
 
 # 96-voc convention (same as CTW1500 / SemiETS):
@@ -112,9 +113,83 @@ def _reorder_quad(pts):
     return [TL, TR, BR, BL]
 
 
+def _principal_axis(pts):
+    """
+    Calcola l'asse principale del poligono tramite PCA approssimata:
+    restituisce il vettore unitario (dx, dy) che massimizza la varianza
+    dei punti proiettati.
+
+    Viene usato per separare top/bottom nei poligoni obliqui: l'asse
+    perpendicolare a questo vettore divide il poligono in meta' superiore
+    e meta' inferiore rispetto alla direzione del testo.
+    """
+    n = len(pts)
+    cx = sum(p[0] for p in pts) / n
+    cy = sum(p[1] for p in pts) / n
+
+    # Matrice di covarianza 2x2
+    sxx = sum((p[0] - cx) ** 2 for p in pts)
+    syy = sum((p[1] - cy) ** 2 for p in pts)
+    sxy = sum((p[0] - cx) * (p[1] - cy) for p in pts)
+
+    # Autovettore dominante tramite formula analitica 2x2
+    diff = sxx - syy
+    angle = 0.5 * math.atan2(2.0 * sxy, diff) if (diff != 0 or sxy != 0) else 0.0
+    dx = math.cos(angle)
+    dy = math.sin(angle)
+    return dx, dy, cx, cy
+
+
+def _split_top_bottom_by_axis(pts):
+    """
+    Divide i punti del poligono in due gruppi (top / bottom) proiettando
+    ogni punto sull'asse PERPENDICOLARE all'asse principale del poligono.
+
+    Questo e' il fix per i casi complessi (poligoni obliqui, ruotati,
+    non-rettangolari con n>4 vertici) dove la semplice divisione per y
+    produce self-intersection nelle curve di Bezier.
+
+    Strategia:
+      1. Calcola l'asse principale (PCA) e il centroide.
+      2. Proietta ogni punto sull'asse perpendicolare all'asse principale.
+      3. Punti con proiezione < 0 -> top half (margine superiore del testo)
+         Punti con proiezione >= 0 -> bottom half (margine inferiore)
+      4. Se un gruppo e' vuoto (es. tutti i punti su un lato), fallback
+         alla divisione per y globale.
+
+    Restituisce (top_pts, bot_pts) dove:
+      top_pts: lista di punti del bordo superiore, ordinati per x crescente
+      bot_pts: lista di punti del bordo inferiore, ordinati per x crescente
+    """
+    dx, dy, cx, cy = _principal_axis(pts)
+
+    # Vettore perpendicolare all'asse principale (ruota di 90 gradi)
+    px, py = -dy, dx
+
+    # Proiezione di ogni punto sull'asse perpendicolare (rispetto al centroide)
+    projections = [(p[0] - cx) * px + (p[1] - cy) * py for p in pts]
+    med = sorted(projections)[len(projections) // 2]  # mediana
+
+    top_pts = [p for p, proj in zip(pts, projections) if proj <= med]
+    bot_pts = [p for p, proj in zip(pts, projections) if proj > med]
+
+    # Fallback: se un gruppo e' vuoto usa divisione per y
+    if not top_pts or not bot_pts:
+        by_y = sorted(pts, key=lambda p: p[1])
+        half = max(1, len(pts) // 2)
+        top_pts = by_y[:half]
+        bot_pts = by_y[half:]
+
+    # Ordina ciascun gruppo per x crescente (sinistra -> destra)
+    top_pts = sorted(top_pts, key=lambda p: p[0])
+    bot_pts = sorted(bot_pts, key=lambda p: p[0])
+
+    return top_pts, bot_pts
+
+
 def _poly_to_bezier(pts):
     """
-    Converte un poligono HierText (4+ vertici) in 8 punti di controllo
+    Converte un poligono HierText (3+ vertici) in 8 punti di controllo
     cubici di Bezier (16 valori float), seguendo ESATTAMENTE la convenzione
     CTW1500:
 
@@ -130,32 +205,56 @@ def _poly_to_bezier(pts):
         linearmente a 1/3 e 2/3 del segmento (curva degenere = retta
         per testo orizzontale, o spline approssimata per poligoni obliqui).
 
-    FIX self-intersection (rispetto alla versione precedente):
-      I vertici vengono riordinati in [TL, TR, BR, BL] prima di estrarre
-      gli anchor points. Questo garantisce che la curva TOP vada sempre
-      da sinistra a destra e la curva BOT da destra a sinistra, evitando
-      che il ring chiuso si auto-interseca quando HierText fornisce i
-      vertici in ordine non-standard (antiorario, ruotato, ecc.).
+    FIX self-intersection per casi complessi (n>4):
+      Per poligoni con piu' di 4 vertici si usa _split_top_bottom_by_axis,
+      che separa i punti in top/bottom proiettando sull'asse perpendicolare
+      all'asse principale del poligono (PCA approssimata). Questo gestisce
+      correttamente poligoni obliqui, ruotati, concavi e qualsiasi forma
+      non-rettangolare dove la semplice divisione per y produceva
+      self-intersection.
 
-      Per poligoni con piu' di 4 vertici si individuano i 4 anchor points
-      separando i punti per y (top half / bottom half) e poi per x.
+    FIX triangoli (n==3):
+      Il triangolo viene trattato come caso speciale: il punto singolo
+      piu' in alto e' sia TL che TR (curva top degenere), mentre i due
+      punti piu' in basso formano il bordo bottom.
+
+    FIX quad (n==4):
+      Usa _reorder_quad per normalizzare in [TL, TR, BR, BL] indipendentemente
+      dall'ordine originale dei vertici.
     """
     n = len(pts)
 
-    if n == 4:
+    if n == 3:
+        # Triangolo: il punto con y minima e' l'apice (top), gli altri due sono la base (bot)
+        by_y = sorted(pts, key=lambda p: p[1])
+        apex = by_y[0]
+        base = sorted(by_y[1:], key=lambda p: p[0])
+        TL = apex
+        TR = apex
+        BL = base[0]
+        BR = base[1]
+
+    elif n == 4:
         # Riordina sempre in [TL, TR, BR, BL] indipendentemente dall'ordine originale
         ordered = _reorder_quad(pts)
         TL, TR, BR, BL = ordered[0], ordered[1], ordered[2], ordered[3]
+
     else:
-        # Poligono con >4 vertici: separa top-edge e bottom-edge per y
-        half = max(2, n // 2)
-        by_y = sorted(pts, key=lambda p: p[1])
-        top_pts = sorted(by_y[:half], key=lambda p: p[0])
-        bot_pts = sorted(by_y[-half:], key=lambda p: p[0])
-        TL = top_pts[0]   # top-left:    min x tra i top
-        TR = top_pts[-1]  # top-right:   max x tra i top
-        BL = bot_pts[0]   # bottom-left: min x tra i bot
-        BR = bot_pts[-1]  # bottom-right: max x tra i bot
+        # Poligono con >4 vertici: usa separazione basata sull'asse principale (PCA)
+        # per gestire correttamente poligoni obliqui, ruotati e concavi.
+        top_pts, bot_pts = _split_top_bottom_by_axis(pts)
+
+        TL = top_pts[0]    # top-left:     min x tra i top
+        TR = top_pts[-1]   # top-right:    max x tra i top
+        BL = bot_pts[0]    # bottom-left:  min x tra i bot
+        BR = bot_pts[-1]   # bottom-right: max x tra i bot
+
+        # Sanity check: se TL.x > TR.x o BL.x > BR.x dopo la PCA
+        # (puo' succedere su poligoni molto obliqui), fallback a _reorder_quad
+        # applicato ai 4 estremi trovati.
+        if TL[0] > TR[0] or BL[0] > BR[0]:
+            ordered = _reorder_quad([TL, TR, BR, BL])
+            TL, TR, BR, BL = ordered[0], ordered[1], ordered[2], ordered[3]
 
     # Curva TOP: TL -> TR  (sinistra -> destra, margine superiore)
     top_p0 = TL
@@ -269,8 +368,13 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
       Punti 0-3: curva cubica TOP  (TL -> TR, da sinistra a destra)
       Punti 4-7: curva cubica BOT  (BR -> BL, da destra a sinistra)
       I punti di controllo interni sono interpolati linearmente a 1/3 e 2/3.
-      I vertici vengono SEMPRE riordinati in [TL, TR, BR, BL] per prevenire
-      self-intersection nel ring bezier (fix rispetto alla versione precedente).
+
+      Gestione poligoni complessi (FIX self-intersection):
+        - n==3 (triangolo): apice = TL=TR, base = BL/BR
+        - n==4 (quad):      _reorder_quad -> [TL, TR, BR, BL]
+        - n>4  (poligono):  _split_top_bottom_by_axis (PCA) -> top/bot
+          La separazione PCA gestisce poligoni obliqui, ruotati e concavi
+          dove la semplice divisione per y generava self-intersection.
 
     Struttura bbox (convenzione CTW1500):
       Calcolata come min/max degli 8 punti di controllo bezier (NON dei
@@ -323,10 +427,9 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     else:
                         n_absolute += 1
 
-                    # --- bezier_pts: vertici riordinati in [TL,TR,BR,BL] ---
-                    # I vertici vengono riordinati prima di estrarre gli anchor points,
-                    # prevenendo la self-intersection del ring bezier quando HierText
-                    # fornisce i vertici in ordine non-standard (antiorario, ruotato, ecc.)
+                    # --- bezier_pts ---
+                    # _poly_to_bezier gestisce n==3, n==4 e n>4 con algoritmi
+                    # dedicati per prevenire self-intersection in tutti i casi.
                     bezier = _poly_to_bezier(pts)
 
                     # --- bbox: min/max sugli 8 punti di controllo bezier, clippato ---
