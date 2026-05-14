@@ -22,19 +22,17 @@ curva inferiore (4 cp), ognuna nel verso "da sinistra a destra".
 Come fa CTW1500: i punti vengono generati a partire dai poligoni della
 bounding box della parola. Per ogni istanza:
   - top = punti che formano il bordo superiore (ordinati da sx a dx)
-  - bot = punti che formano il bordo inferiore (ordinati da sx a dx)
+  - bot = punti che formano il bordo inferiore (ordinati da dx a sx)
   - fit cubica di Bezier su top e su bot separatamente via least-squares
-  - validazione del ring: si campionano num_pts punti e si controlla
-    che il LinearRing risultante sia simple (no self-intersection)
+  - validazione del ring: top (sx->dx) + bot (dx->sx) = anello chiuso
   - in caso di fallimento si usa il convex_hull del poligono originale
     come fallback deterministico
 
 Formati di input supportati:
-  - .json               : JSON completo { "annotations": [...] }  (formato Google ufficiale)
-  - .jsonl              : stesso formato .json ma con estensione diversa (Google lo chiama cosi)
-  - .jsonl  (vero JSONL): un oggetto JSON per riga (un'immagine per riga)
-  - .jsonl.gz / .gz     : versione compressa del vero JSONL
-  Lo script detecta automaticamente il formato leggendo il primo byte.
+  - .json / .jsonl (inizia con '{') : JSON completo {"annotations": [...]}
+  - .jsonl (vero JSONL, inizia con altro) : un oggetto JSON per riga
+  - .jsonl.gz / .gz : versione compressa
+  Lo script detecta automaticamente il formato dal primo carattere.
 
 Vocabolari supportati:
   - 37  : a-z + cifre + illeggibile (indice 36)
@@ -136,12 +134,14 @@ def split_top_bottom(pts):
     """
     Divide i punti del poligono in bordo superiore e inferiore usando PCA.
 
+    Convenzione di orientamento del ring:
+      - top_pts : ordinati sx -> dx lungo l'asse principale
+      - bot_pts : ordinati dx -> sx lungo l'asse principale
+    In questo modo top+bot formano un anello chiuso senza incroci.
+
     Questo e il motivo per cui CTW1500 non genera mai self-intersection:
     usa la direzione reale del testo (asse principale via SVD) invece
     dell'asse y fisso, che fallisce per testi curvi o ruotati.
-
-    Ritorna (top_pts, bot_pts) entrambi ordinati da sinistra a destra
-    lungo la direzione principale.
     """
     pts = np.asarray(pts, dtype=float)
     _, unique_idx = np.unique(pts, axis=0, return_index=True)
@@ -150,8 +150,8 @@ def split_top_bottom(pts):
     if len(pts) < 4:
         xmin, ymin = pts[:, 0].min(), pts[:, 1].min()
         xmax, ymax = pts[:, 0].max(), pts[:, 1].max()
-        return (np.array([[xmin, ymin], [xmax, ymin]]),
-                np.array([[xmin, ymax], [xmax, ymax]]))
+        return (np.array([[xmin, ymin], [xmax, ymin]]),   # top: sx->dx
+                np.array([[xmax, ymax], [xmin, ymax]]))   # bot: dx->sx
 
     cx, cy = pts.mean(axis=0)
     centered = pts - np.array([cx, cy])
@@ -173,9 +173,11 @@ def split_top_bottom(pts):
             xmin, ymin = pts[:, 0].min(), pts[:, 1].min()
             xmax, ymax = pts[:, 0].max(), pts[:, 1].max()
             return (np.array([[xmin, ymin], [xmax, ymin]]),
-                    np.array([[xmin, ymax], [xmax, ymax]]))
+                    np.array([[xmax, ymax], [xmin, ymax]]))
 
+    # top: sx -> dx (proj_main crescente)
     top_pts = pts[top_mask][np.argsort(proj_main[top_mask])]
+    # bot: dx -> sx (proj_main decrescente) per chiudere il ring
     bot_pts = pts[bot_mask][np.argsort(-proj_main[bot_mask])]
     return top_pts, bot_pts
 
@@ -188,11 +190,16 @@ def validate_ring(cp_top, cp_bot, num_pts=25):
     Verifica che il ring generato da cp_top e cp_bot sia un LinearRing
     semplice (nessuna self-intersection).
 
+    Convenzione:
+      cp_top campiona da sx a dx
+      cp_bot campiona da dx a sx  (gia nella direzione giusta dal fit)
+    Il ring e: top_sampled + bot_sampled  (NO inversione di bot)
+
     Ritorna (is_valid: bool, ring_pts: ndarray (2*num_pts, 2))
     """
-    top_sampled = sample_bezier(cp_top, num_pts)
-    bot_sampled = sample_bezier(cp_bot, num_pts)
-    ring_pts = np.vstack([top_sampled, bot_sampled[::-1]])
+    top_sampled = sample_bezier(cp_top, num_pts)   # sx -> dx
+    bot_sampled = sample_bezier(cp_bot, num_pts)   # dx -> sx (gia corretto)
+    ring_pts = np.vstack([top_sampled, bot_sampled])  # anello chiuso
     try:
         return LinearRing(ring_pts).is_simple, ring_pts
     except Exception:
@@ -232,7 +239,8 @@ def bezier_from_polygon(vertices, num_pts=25):
                              [xmax, ymax], [xmin, ymax]])
         cp_top, cp_bot, valid = _try(bbox_pts)
         if not valid:
-            log.warning("Fallback bbox: poligono degenere, scartato")
+            # Geometricamente impossibile per una bbox: bug numerico estremo
+            log.warning("Fallback bbox invalido: poligono degenere, scartato")
             return None, False
 
     return cp_top.flatten().tolist() + cp_bot.flatten().tolist(), valid
@@ -261,41 +269,31 @@ def parse_hiertext(input_path):
 
     Google distribuisce i file come .jsonl ma in realta sono JSON completi
     con struttura {"annotations": [...]} -- NON vero JSONL (un oggetto/riga).
-    Questa funzione gestisce entrambi i casi:
+    Questa funzione gestisce entrambi i casi leggendo il primo carattere:
 
-      Caso A - JSON completo (file inizia con '{'):
-        Carica con json.load e ritorna data["annotations"].
-        Questo e il formato di train.jsonl e validation.jsonl ufficiali.
-
-      Caso B - Vero JSONL (file inizia con '[' o primo char non e '{'):
-        Legge riga per riga, ogni riga e un dict immagine.
-
-      Caso C - .gz:
-        Apre con gzip e applica lo stesso auto-detect.
+      Caso A - primo char '{': JSON completo -> json.load -> data["annotations"]
+      Caso B - altro:          vero JSONL    -> lettura riga per riga
+      Caso C - .gz:            gzip + stesso auto-detect
     """
     input_path = Path(input_path)
     path_str = str(input_path)
 
-    # Leggi il primo carattere non-whitespace per capire il formato
+    def _first_char(fh):
+        for ch in fh.read(4096):
+            if ch.strip():
+                return ch
+        return ""
+
     if path_str.endswith(".gz"):
         with gzip.open(path_str, "rt", encoding="utf-8") as f:
-            first_char = ""
-            for ch in f.read(4096):
-                if ch.strip():
-                    first_char = ch
-                    break
+            first_char = _first_char(f)
     else:
         with open(path_str, "r", encoding="utf-8") as f:
-            first_char = ""
-            for ch in f.read(4096):
-                if ch.strip():
-                    first_char = ch
-                    break
+            first_char = _first_char(f)
 
-    log.info(f"Formato rilevato: primo carattere = '{first_char}' in {input_path.name}")
+    log.info(f"Formato rilevato: primo char='{first_char}' ({input_path.name})")
 
     if first_char == "{":
-        # Caso A: JSON completo con {"annotations": [...]}
         log.info("Modalita: JSON completo (formato Google ufficiale)")
         if path_str.endswith(".gz"):
             with gzip.open(path_str, "rt", encoding="utf-8") as f:
@@ -305,15 +303,13 @@ def parse_hiertext(input_path):
                 data = json.load(f)
         records = data.get("annotations", [])
         if not records:
-            # Potrebbe essere un dict singolo di un'immagine
             records = [data]
-        log.info(f"  Record (immagini) trovati: {len(records)}")
+        log.info(f"  Record trovati: {len(records)}")
         return records
     else:
-        # Caso B: vero JSONL, un oggetto per riga
         log.info("Modalita: JSONL (un oggetto per riga)")
         records = _read_jsonl_lines(path_str)
-        log.info(f"  Record (immagini) trovati: {len(records)}")
+        log.info(f"  Record trovati: {len(records)}")
         return records
 
 
