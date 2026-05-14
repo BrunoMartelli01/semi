@@ -187,98 +187,259 @@ def _split_top_bottom_by_axis(pts):
     return top_pts, bot_pts
 
 
+def _eval_cubic(p0, p1, p2, p3, t):
+    """Valuta una Bezier cubica in t."""
+    mt = 1.0 - t
+    mt2 = mt * mt
+    t2 = t * t
+    a = mt2 * mt
+    b = 3.0 * mt2 * t
+    c = 3.0 * mt * t2
+    d = t * t2
+    x = a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0]
+    y = a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]
+    return [x, y]
+
+
+def _segments_intersect(a1, a2, b1, b2, eps=1e-6):
+    """Test di intersezione fra segmenti a1-a2 e b1-b2, robusto con segmenti degeneri."""
+    def _orient(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    def _on_seg(p, q, r):
+        return (min(p[0], r[0]) - eps <= q[0] <= max(p[0], r[0]) + eps and
+                min(p[1], r[1]) - eps <= q[1] <= max(p[1], r[1]) + eps)
+
+    o1 = _orient(a1, a2, b1)
+    o2 = _orient(a1, a2, b2)
+    o3 = _orient(b1, b2, a1)
+    o4 = _orient(b1, b2, a2)
+
+    if o1 * o2 < 0 and o3 * o4 < 0:
+        return True
+
+    if abs(o1) < eps and _on_seg(a1, b1, a2):
+        return True
+    if abs(o2) < eps and _on_seg(a1, b2, a2):
+        return True
+    if abs(o3) < eps and _on_seg(b1, a1, b2):
+        return True
+    if abs(o4) < eps and _on_seg(b1, a2, b2):
+        return True
+    return False
+
+
+def _ring_has_self_intersection(bezier, n_samples=40):
+    """Campiona il ring (top+bottom) e controlla self-intersection."""
+    pts_ctrl = [[bezier[2 * i], bezier[2 * i + 1]] for i in range(8)]
+    top = pts_ctrl[0:4]
+    bot = pts_ctrl[4:8]
+
+    ts = [i / (n_samples - 1) for i in range(n_samples)]
+    top_s = [_eval_cubic(*top, t) for t in ts]
+    bot_s = [_eval_cubic(*bot, t) for t in ts]
+    bot_s.reverse()
+
+    ring = top_s + bot_s
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])
+
+    m = len(ring)
+    for i in range(m - 1):
+        a1, a2 = ring[i], ring[i + 1]
+        for j in range(i + 2, m - 1):
+            if j == i or j == i + 1:
+                continue
+            b1, b2 = ring[j], ring[j + 1]
+            if _segments_intersect(a1, a2, b1, b2):
+                return True
+    return False
+
+
+def _bbox_bezier_from_pts(pts):
+    """Fallback: bounding box dei punti come ring Bezier rettangolare CTW1500."""
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+
+    TL = [xmin, ymin]
+    TR = [xmax, ymin]
+    BR = [xmax, ymax]
+    BL = [xmin, ymax]
+
+    top_p0 = TL
+    top_p3 = TR
+    top_p1 = _lerp(TL, TR, 1.0 / 3.0)
+    top_p2 = _lerp(TL, TR, 2.0 / 3.0)
+
+    bot_p0 = BR
+    bot_p3 = BL
+    bot_p1 = _lerp(BR, BL, 1.0 / 3.0)
+    bot_p2 = _lerp(BR, BL, 2.0 / 3.0)
+
+    bezier = [coord for p in [top_p0, top_p1, top_p2, top_p3,
+                              bot_p0, bot_p1, bot_p2, bot_p3]
+              for coord in p]
+    return bezier
+
+
+def _curve_to_bezier(curve):
+    """Adatta una polilinea 2D con una Bezier cubica (4 controlli) in least-squares."""
+    curve = np.asarray(curve, dtype=float).reshape(-1, 2)
+    m = len(curve)
+    if m <= 1:
+        return np.vstack([curve[0]] * 4)
+
+    if m == 2:
+        p0, p3 = curve[0], curve[1]
+        p1 = _lerp(p0, p3, 1.0 / 3.0)
+        p2 = _lerp(p0, p3, 2.0 / 3.0)
+        return np.vstack([p0, p1, p2, p3])
+
+    diff = curve[1:] - curve[:-1]
+    dist = np.linalg.norm(diff, axis=-1)
+    total = dist.sum()
+    if total <= 1e-6:
+        return np.vstack([curve[0]] * 4)
+
+    norm = dist / total
+    norm = np.concatenate([[0.0], norm])
+    t = norm.cumsum()
+
+    B = np.stack([
+        (1 - t) ** 3,
+        3 * (1 - t) ** 2 * t,
+        3 * (1 - t) * t ** 2,
+        t ** 3
+    ], axis=1)
+
+    pseudo_inv = np.linalg.pinv(B)
+    ctrl = pseudo_inv.dot(curve)
+    ctrl[0] = curve[0]
+    ctrl[-1] = curve[-1]
+    return ctrl
+
+
 def _poly_to_bezier(pts):
-    """
-    Converte un poligono (>=3 vertici, ordinati lungo il contorno) in 8 punti di controllo
-    di Bezier cubiche secondo la convenzione CTW1500:
-
-        bezier_pts = [TOP_p0, TOP_p1, TOP_p2, TOP_p3,
-                      BOT_p0, BOT_p1, BOT_p2, BOT_p3]
-
-    - Curva TOP: dal bordo sinistro al destro, segue il margine superiore.
-    - Curva BOT: dal bordo destro al sinistro, segue il margine inferiore.
-    - Il ring risultante (TOP + BOT + chiusura) è sempre chiuso.
-    """
-
-    # Copia locale e rimuove eventuale punto finale duplicato (poligono chiuso p0==pN)
+    """Versione finale robusta per HierText, con controllo self-intersection."""
     pts = [list(p) for p in pts]
-    if len(pts) > 1 and pts[0][0] == pts[-1][0] and pts[0][1] == pts[-1][1]:
-        pts = pts[:-1]
+    if not pts:
+        return [0.0] * 16
 
+    # deduplica consecutivi
+    dedup = [pts[0]]
+    for p in pts[1:]:
+        if p != dedup[-1]:
+            dedup.append(p)
+    pts = dedup
     n = len(pts)
-    if n < 3:
-        # troppo pochi punti per definire un'area
-        # fallback: segmento degenere
-        p0, p3 = pts[0], pts[-1]
+
+    if n == 1:
+        p0 = pts[0]
+        return [p0[0], p0[1]] * 8
+
+    if n == 2:
+        p0, p3 = pts[0], pts[1]
         top_p0 = p0
+        top_p3 = p3
         top_p1 = _lerp(p0, p3, 1.0 / 3.0)
         top_p2 = _lerp(p0, p3, 2.0 / 3.0)
-        top_p3 = p3
-        bot_p0, bot_p1, bot_p2, bot_p3 = top_p3, top_p2, top_p1, top_p0
+        bot_p0, bot_p3 = top_p3, top_p0
+        bot_p1, bot_p2 = top_p2, top_p1
         bezier = [coord for p in [top_p0, top_p1, top_p2, top_p3,
                                   bot_p0, bot_p1, bot_p2, bot_p3]
                   for coord in p]
         return bezier
 
-    # 1) Trova il punto più a sinistra (TL-ish) e quello più a destra (TR/BR-ish)
-    #    usando l'ordine del poligono così com'è.
-    def _key_left(p):
-        return (p[0], p[1])  # min x, poi min y
+    if n == 3:
+        by_y = sorted(pts, key=lambda p: p[1])
+        apex = by_y[0]
+        base = sorted(by_y[1:], key=lambda p: p[0])
+        TL = apex
+        TR = apex
+        BL = base[0]
+        BR = base[1]
 
-    def _key_right(p):
-        return (-p[0], p[1])  # max x, poi min y
+        top_p0 = TL
+        top_p1 = _lerp(TL, TR, 1.0 / 3.0)
+        top_p2 = _lerp(TL, TR, 2.0 / 3.0)
+        top_p3 = TR
 
-    left_idx = min(range(n), key=lambda i: _key_left(pts[i]))
-    right_idx = min(range(n), key=lambda i: _key_right(pts[i]))
+        bot_p0 = BR
+        bot_p1 = _lerp(BR, BL, 1.0 / 3.0)
+        bot_p2 = _lerp(BR, BL, 2.0 / 3.0)
+        bot_p3 = BL
 
-    # 2) Costruisce due catene dal poligono:
-    #    - chain1: da left_idx -> ... -> right_idx (seguendo l'ordine)
-    #    - chain2: il resto del contorno che chiude da right_idx -> ... -> left_idx
+        bezier = [coord for p in [top_p0, top_p1, top_p2, top_p3,
+                                  bot_p0, bot_p1, bot_p2, bot_p3]
+                  for coord in p]
+        return bezier
+
+    # n >= 4
+    if n == 4:
+        TL, TR, BR, BL = _reorder_quad(pts)
+
+        top_p0 = TL
+        top_p3 = TR
+        top_p1 = _lerp(TL, TR, 1.0 / 3.0)
+        top_p2 = _lerp(TL, TR, 2.0 / 3.0)
+
+        bot_p0 = BR
+        bot_p3 = BL
+        bot_p1 = _lerp(BR, BL, 1.0 / 3.0)
+        bot_p2 = _lerp(BR, BL, 2.0 / 3.0)
+
+        bezier = [coord for p in [top_p0, top_p1, top_p2, top_p3,
+                                  bot_p0, bot_p1, bot_p2, bot_p3]
+                  for coord in p]
+        if _ring_has_self_intersection(bezier):
+            return _bbox_bezier_from_pts(pts)
+        return bezier
+
+    # n > 4: separa contorno in catena superiore/inferiore
+    def _left_key(p):
+        return (p[0], p[1])
+
+    def _right_key(p):
+        return (-p[0], p[1])
+
+    left_idx = min(range(n), key=lambda i: _left_key(pts[i]))
+    right_idx = min(range(n), key=lambda i: _right_key(pts[i]))
+
     if left_idx <= right_idx:
-        chain_top = pts[left_idx:right_idx + 1]
-        chain_bottom = pts[right_idx:] + pts[:left_idx + 1]
+        chain1 = pts[left_idx:right_idx + 1]
+        chain2 = pts[right_idx:] + pts[:left_idx + 1]
     else:
-        chain_top = pts[left_idx:] + pts[:right_idx + 1]
-        chain_bottom = pts[right_idx:left_idx + 1]
+        chain1 = pts[left_idx:] + pts[:right_idx + 1]
+        chain2 = pts[right_idx:left_idx + 1]
 
-    # Ora chain_top va da sinistra a destra (bordo superiore),
-    # chain_bottom chiude da destra a sinistra lungo il bordo inferiore.
-    # Se per qualche motivo la bottom è in direzione opposta, inverti.
-    if len(chain_bottom) >= 2 and chain_bottom[0][0] < chain_bottom[-1][0]:
-        chain_bottom.reverse()
+    def _mean_y(chain):
+        return sum(p[1] for p in chain) / max(1, len(chain))
 
-    # 3) Helper per approssimare una polilinea con una cubica mantenendo gli estremi
-    def _fit_cubic(poly):
-        m = len(poly)
-        p0 = poly[0]
-        p3 = poly[-1]
+    if _mean_y(chain1) <= _mean_y(chain2):
+        top_chain, bot_chain = chain1, chain2
+    else:
+        top_chain, bot_chain = chain2, chain1
 
-        if m <= 2:
-            # linea retta degenere
-            p1 = _lerp(p0, p3, 1.0 / 3.0)
-            p2 = _lerp(p0, p3, 2.0 / 3.0)
-        elif m == 3:
-            # usa il punto intermedio come controllo interno
-            mid = poly[1]
-            p1 = mid
-            p2 = mid
-        else:
-            # prendi punti in posizione ~1/3 e ~2/3 lungo la catena
-            idx1 = m // 3
-            idx2 = (2 * m) // 3
-            p1 = poly[idx1]
-            p2 = poly[idx2]
+    if len(top_chain) >= 2 and top_chain[0][0] > top_chain[-1][0]:
+        top_chain = list(reversed(top_chain))
+    if len(bot_chain) >= 2 and bot_chain[0][0] < bot_chain[-1][0]:
+        bot_chain = list(reversed(bot_chain))
 
-        return [p0, p1, p2, p3]
+    top_ctrl = _curve_to_bezier(top_chain)
+    bot_ctrl = _curve_to_bezier(bot_chain)
 
-    # 4) Costruisci la curva TOP (sinistra -> destra) e BOT (destra -> sinistra)
-    top_p0, top_p1, top_p2, top_p3 = _fit_cubic(chain_top)
-    bot_p0, bot_p1, bot_p2, bot_p3 = _fit_cubic(chain_bottom)
+    top_p0, top_p1, top_p2, top_p3 = top_ctrl.tolist()
+    bot_p0, bot_p1, bot_p2, bot_p3 = bot_ctrl.tolist()
 
-    # 5) Pack nel formato CTW1500: prima i 4 TOP, poi i 4 BOT
     bezier = [coord for p in [top_p0, top_p1, top_p2, top_p3,
                               bot_p0, bot_p1, bot_p2, bot_p3]
               for coord in p]
+
+    if _ring_has_self_intersection(bezier):
+        bezier = _bbox_bezier_from_pts(pts)
+
     return bezier
 
 def _bezier_bbox(bezier, img_w=None, img_h=None):
