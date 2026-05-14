@@ -31,8 +31,8 @@ _PREDEFINED_SPLITS_TEXT = {
     "hiertext_train_96voc": ("hiertext/train_images", "hiertext/train_96voc.json"),
 
     # 0.5 % split
-    "hiertext_train_0.5_label":   ("hiertext/train_images", "hiertext/train_96voc_5_labeled.json"),
-    "hiertext_train_0.5_unlabel": ("hiertext/train_images", "hiertext/train_96voc_5_unlabeled.json"),
+    "hiertext_train_0.5_label":   ("hiertext/train_images", "hiertext/train_96voc_0.5_labeled.json"),
+    "hiertext_train_0.5_unlabel": ("hiertext/train_images", "hiertext/train_96voc_0.5_unlabeled.json"),
 
     # 1 % split
     "hiertext_train_1_label":   ("hiertext/train_images", "hiertext/train_96voc_1_labeled.json"),
