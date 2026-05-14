@@ -189,92 +189,97 @@ def _split_top_bottom_by_axis(pts):
 
 def _poly_to_bezier(pts):
     """
-    Converte un poligono HierText (3+ vertici) in 8 punti di controllo
-    cubici di Bezier (16 valori float), seguendo ESATTAMENTE la convenzione
-    CTW1500:
+    Converte un poligono (>=3 vertici, ordinati lungo il contorno) in 8 punti di controllo
+    di Bezier cubiche secondo la convenzione CTW1500:
 
-      bezier_pts = [TOP_p0, TOP_p1, TOP_p2, TOP_p3,
-                    BOT_p0, BOT_p1, BOT_p2, BOT_p3]
+        bezier_pts = [TOP_p0, TOP_p1, TOP_p2, TOP_p3,
+                      BOT_p0, BOT_p1, BOT_p2, BOT_p3]
 
-    Convenzione CTW1500 (verificata su train_96voc_1_labeled.json):
-      - Curva TOP: dal vertice top-left (TL) al top-right (TR),
-                   da sinistra verso destra.
-      - Curva BOT: dal vertice bottom-right (BR) al bottom-left (BL),
-                   da destra verso sinistra.
-      - I punti di controllo interni (p1, p2) sono interpolati
-        linearmente a 1/3 e 2/3 del segmento (curva degenere = retta
-        per testo orizzontale, o spline approssimata per poligoni obliqui).
-
-    FIX self-intersection per casi complessi (n>4):
-      Per poligoni con piu' di 4 vertici si usa _split_top_bottom_by_axis,
-      che separa i punti in top/bottom proiettando sull'asse perpendicolare
-      all'asse principale del poligono (PCA approssimata). Questo gestisce
-      correttamente poligoni obliqui, ruotati, concavi e qualsiasi forma
-      non-rettangolare dove la semplice divisione per y produceva
-      self-intersection.
-
-    FIX triangoli (n==3):
-      Il triangolo viene trattato come caso speciale: il punto singolo
-      piu' in alto e' sia TL che TR (curva top degenere), mentre i due
-      punti piu' in basso formano il bordo bottom.
-
-    FIX quad (n==4):
-      Usa _reorder_quad per normalizzare in [TL, TR, BR, BL] indipendentemente
-      dall'ordine originale dei vertici.
+    - Curva TOP: dal bordo sinistro al destro, segue il margine superiore.
+    - Curva BOT: dal bordo destro al sinistro, segue il margine inferiore.
+    - Il ring risultante (TOP + BOT + chiusura) è sempre chiuso.
     """
+
+    # Copia locale e rimuove eventuale punto finale duplicato (poligono chiuso p0==pN)
+    pts = [list(p) for p in pts]
+    if len(pts) > 1 and pts[0][0] == pts[-1][0] and pts[0][1] == pts[-1][1]:
+        pts = pts[:-1]
+
     n = len(pts)
+    if n < 3:
+        # troppo pochi punti per definire un'area
+        # fallback: segmento degenere
+        p0, p3 = pts[0], pts[-1]
+        top_p0 = p0
+        top_p1 = _lerp(p0, p3, 1.0 / 3.0)
+        top_p2 = _lerp(p0, p3, 2.0 / 3.0)
+        top_p3 = p3
+        bot_p0, bot_p1, bot_p2, bot_p3 = top_p3, top_p2, top_p1, top_p0
+        bezier = [coord for p in [top_p0, top_p1, top_p2, top_p3,
+                                  bot_p0, bot_p1, bot_p2, bot_p3]
+                  for coord in p]
+        return bezier
 
-    if n == 3:
-        # Triangolo: il punto con y minima e' l'apice (top), gli altri due sono la base (bot)
-        by_y = sorted(pts, key=lambda p: p[1])
-        apex = by_y[0]
-        base = sorted(by_y[1:], key=lambda p: p[0])
-        TL = apex
-        TR = apex
-        BL = base[0]
-        BR = base[1]
+    # 1) Trova il punto più a sinistra (TL-ish) e quello più a destra (TR/BR-ish)
+    #    usando l'ordine del poligono così com'è.
+    def _key_left(p):
+        return (p[0], p[1])  # min x, poi min y
 
-    elif n == 4:
-        # Riordina sempre in [TL, TR, BR, BL] indipendentemente dall'ordine originale
-        ordered = _reorder_quad(pts)
-        TL, TR, BR, BL = ordered[0], ordered[1], ordered[2], ordered[3]
+    def _key_right(p):
+        return (-p[0], p[1])  # max x, poi min y
 
+    left_idx = min(range(n), key=lambda i: _key_left(pts[i]))
+    right_idx = min(range(n), key=lambda i: _key_right(pts[i]))
+
+    # 2) Costruisce due catene dal poligono:
+    #    - chain1: da left_idx -> ... -> right_idx (seguendo l'ordine)
+    #    - chain2: il resto del contorno che chiude da right_idx -> ... -> left_idx
+    if left_idx <= right_idx:
+        chain_top = pts[left_idx:right_idx + 1]
+        chain_bottom = pts[right_idx:] + pts[:left_idx + 1]
     else:
-        # Poligono con >4 vertici: usa separazione basata sull'asse principale (PCA)
-        # per gestire correttamente poligoni obliqui, ruotati e concavi.
-        top_pts, bot_pts = _split_top_bottom_by_axis(pts)
+        chain_top = pts[left_idx:] + pts[:right_idx + 1]
+        chain_bottom = pts[right_idx:left_idx + 1]
 
-        TL = top_pts[0]    # top-left:     min x tra i top
-        TR = top_pts[-1]   # top-right:    max x tra i top
-        BL = bot_pts[0]    # bottom-left:  min x tra i bot
-        BR = bot_pts[-1]   # bottom-right: max x tra i bot
+    # Ora chain_top va da sinistra a destra (bordo superiore),
+    # chain_bottom chiude da destra a sinistra lungo il bordo inferiore.
+    # Se per qualche motivo la bottom è in direzione opposta, inverti.
+    if len(chain_bottom) >= 2 and chain_bottom[0][0] < chain_bottom[-1][0]:
+        chain_bottom.reverse()
 
-        # Sanity check: se TL.x > TR.x o BL.x > BR.x dopo la PCA
-        # (puo' succedere su poligoni molto obliqui), fallback a _reorder_quad
-        # applicato ai 4 estremi trovati.
-        if TL[0] > TR[0] or BL[0] > BR[0]:
-            ordered = _reorder_quad([TL, TR, BR, BL])
-            TL, TR, BR, BL = ordered[0], ordered[1], ordered[2], ordered[3]
+    # 3) Helper per approssimare una polilinea con una cubica mantenendo gli estremi
+    def _fit_cubic(poly):
+        m = len(poly)
+        p0 = poly[0]
+        p3 = poly[-1]
 
-    # Curva TOP: TL -> TR  (sinistra -> destra, margine superiore)
-    top_p0 = TL
-    top_p1 = _lerp(TL, TR, 1.0 / 3.0)
-    top_p2 = _lerp(TL, TR, 2.0 / 3.0)
-    top_p3 = TR
+        if m <= 2:
+            # linea retta degenere
+            p1 = _lerp(p0, p3, 1.0 / 3.0)
+            p2 = _lerp(p0, p3, 2.0 / 3.0)
+        elif m == 3:
+            # usa il punto intermedio come controllo interno
+            mid = poly[1]
+            p1 = mid
+            p2 = mid
+        else:
+            # prendi punti in posizione ~1/3 e ~2/3 lungo la catena
+            idx1 = m // 3
+            idx2 = (2 * m) // 3
+            p1 = poly[idx1]
+            p2 = poly[idx2]
 
-    # Curva BOT: BR -> BL  (destra -> sinistra, margine inferiore)
-    # NOTA: in CTW1500 la curva bottom parte dal lato destro e torna
-    # al lato sinistro, formando un loop chiuso in senso antiorario.
-    bot_p0 = BR
-    bot_p1 = _lerp(BR, BL, 1.0 / 3.0)
-    bot_p2 = _lerp(BR, BL, 2.0 / 3.0)
-    bot_p3 = BL
+        return [p0, p1, p2, p3]
 
+    # 4) Costruisci la curva TOP (sinistra -> destra) e BOT (destra -> sinistra)
+    top_p0, top_p1, top_p2, top_p3 = _fit_cubic(chain_top)
+    bot_p0, bot_p1, bot_p2, bot_p3 = _fit_cubic(chain_bottom)
+
+    # 5) Pack nel formato CTW1500: prima i 4 TOP, poi i 4 BOT
     bezier = [coord for p in [top_p0, top_p1, top_p2, top_p3,
-                               bot_p0, bot_p1, bot_p2, bot_p3]
+                              bot_p0, bot_p1, bot_p2, bot_p3]
               for coord in p]
     return bezier
-
 
 def _bezier_bbox(bezier, img_w=None, img_h=None):
     """
