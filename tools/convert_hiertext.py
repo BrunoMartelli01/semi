@@ -417,8 +417,10 @@ def _poly_to_bezier(pts):
       n==2 : segmento, punti interni interpolati linearmente
       n==3 : triangolo (apice = TL=TR, base = BL/BR)
       n==4 : quadrilatero riordinato con _reorder_quad
-      n>4  : catena top/bottom estratta per x (leftmost -> rightmost),
-             poi fittata con _curve_to_bezier (BezierCurve da curve_utils)
+      n>4  : catena top/bottom estratta tramite _split_top_bottom_by_axis
+             (PCA sul poligono), poi fittata con _curve_to_bezier
+             (BezierCurve da curve_utils). I punti di controllo rispecchiano
+             la forma reale del poligono invece della bounding box.
 
     Dopo il fitting viene applicato il controllo _ring_has_self_intersection;
     in caso positivo si torna al fallback bounding-box.
@@ -521,32 +523,25 @@ def _poly_to_bezier(pts):
             return _bbox_bezier_from_pts(pts)
         return bezier
 
-    # n > 4: separa contorno in catena superiore/inferiore
-    # poi usa BezierCurve (curve_utils) per il fitting least-squares
-    def _left_key(p):
-        return (p[0], p[1])
+    # -----------------------------------------------------------------------
+    # n > 4: usa _split_top_bottom_by_axis (PCA) per dividere il poligono
+    # in catena superiore e inferiore, poi fitta con BezierCurve.
+    #
+    # MOTIVAZIONE DEL FIX:
+    #   Il vecchio approccio usava un traversal manuale basato su left_idx /
+    #   right_idx (punto piu' a sinistra -> punto piu' a destra) che:
+    #     1. Falliva per poligoni non-convex producendo catene top/bot errate.
+    #     2. Generava quasi sempre self-intersection nel ring Bezier, forzando
+    #        il fallback alla bounding box invece di approssimare il poligono.
+    #   _split_top_bottom_by_axis usa la PCA per trovare l'asse principale
+    #   del poligono e divide i vertici per proiezione sull'asse perpendicolare,
+    #   producendo catene geometricamente corrette anche per testi obliqui o
+    #   curvi. I punti di controllo Bezier risultanti rispecchiano la forma
+    #   reale del poligono originale.
+    # -----------------------------------------------------------------------
+    top_chain, bot_chain = _split_top_bottom_by_axis(pts)
 
-    def _right_key(p):
-        return (-p[0], p[1])
-
-    left_idx = min(range(n), key=lambda i: _left_key(pts[i]))
-    right_idx = min(range(n), key=lambda i: _right_key(pts[i]))
-
-    if left_idx <= right_idx:
-        chain1 = pts[left_idx:right_idx + 1]
-        chain2 = pts[right_idx:] + pts[:left_idx + 1]
-    else:
-        chain1 = pts[left_idx:] + pts[:right_idx + 1]
-        chain2 = pts[right_idx:left_idx + 1]
-
-    def _mean_y(chain):
-        return sum(p[1] for p in chain) / max(1, len(chain))
-
-    if _mean_y(chain1) <= _mean_y(chain2):
-        top_chain, bot_chain = chain1, chain2
-    else:
-        top_chain, bot_chain = chain2, chain1
-
+    # Garantisci orientamento: top da sx a dx, bot da dx a sx
     if len(top_chain) >= 2 and top_chain[0][0] > top_chain[-1][0]:
         top_chain = list(reversed(top_chain))
     if len(bot_chain) >= 2 and bot_chain[0][0] < bot_chain[-1][0]:
