@@ -11,10 +11,12 @@ import numpy as np
 # ---------------------------------------------------------------------------
 try:
     from adet.utils.curve_utils import BezierCurve
+    from adet.utils.polygon_utils import simplify_polygon, make_valid_poly
 except ImportError:
     # Fallback: insert repo root in path and try again
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from adet.utils.curve_utils import BezierCurve
+    from adet.utils.polygon_utils import simplify_polygon, make_valid_poly
 
 # 96-voc convention (same as CTW1500 / SemiETS):
 # ASCII printable characters: ' ' (32) ... '~' (126)  -> 95 symbols
@@ -298,6 +300,48 @@ def _bbox_bezier_from_pts(pts):
     return bezier
 
 
+def _clean_polygon(pts, eps=1.0):
+    """
+    Valida e semplifica un poligono prima del fitting Bezier.
+
+    Pipeline:
+      1. make_valid_poly  -> corregge auto-intersezioni e impone orientamento
+                            orario (richiesto da polygon_utils).
+      2. simplify_polygon -> Douglas-Peucker (mode=2) con tolleranza `eps`
+                            pixel per rimuovere vertici ridondanti o quasi-
+                            collineari che degradano la pseudoinversa di Bezier.
+
+    Il valore eps=1.0 pixel e' conservativo: rimuove solo i punti che
+    distano meno di 1 px dalla linea ideale, preservando la forma.
+    Aumentare eps (es. 2-3) per dataset con poligoni molto densi.
+
+    Restituisce una lista di [x, y] float gia' pulita, con almeno 3 punti.
+    Se la semplificazione riduce il poligono a meno di 3 punti, restituisce
+    i punti originali validati senza ulteriore semplificazione.
+    """
+    try:
+        valid_poly = make_valid_poly(pts)
+        coords = list(valid_poly.exterior.coords[:-1])  # rimuovi punto di chiusura duplicato
+    except Exception:
+        coords = pts  # fallback ai punti originali se make_valid_poly fallisce
+
+    if len(coords) < 3:
+        return pts
+
+    try:
+        simplified = simplify_polygon(coords, eps=eps, mode=2)  # Douglas-Peucker
+        simplified_list = [[float(p[0]), float(p[1])] for p in simplified]
+        # Rimuovi eventuale punto di chiusura duplicato introdotto da shapely
+        if len(simplified_list) > 1 and simplified_list[0] == simplified_list[-1]:
+            simplified_list = simplified_list[:-1]
+        if len(simplified_list) >= 3:
+            return simplified_list
+    except Exception:
+        pass
+
+    return [[float(c[0]), float(c[1])] for c in coords]
+
+
 # ---------------------------------------------------------------------------
 # _curve_to_bezier: ora delega a BezierCurve da curve_utils
 # ---------------------------------------------------------------------------
@@ -359,7 +403,16 @@ def _poly_to_bezier(pts):
       Punti 4-7: curva cubica BOT  (da destra a sinistra)
       Totale: 8 punti x 2 coordinate = 16 float
 
-    Algoritmo per numero di vertici:
+    Pre-processing (NUOVO):
+      Prima di qualsiasi operazione, il poligono viene passato a
+      _clean_polygon() che esegue:
+        1. make_valid_poly  -> validazione shapely + orientamento orario
+        2. simplify_polygon -> Douglas-Peucker per rimuovere vertici
+                               ridondanti (eps=1.0 pixel)
+      Questo migliora la qualita' del fitting Bezier, specialmente per
+      poligoni con molti vertici quasi-collineari tipici di HierText.
+
+    Algoritmo per numero di vertici (dopo pulizia):
       n==1 : punto singolo (degenere)
       n==2 : segmento, punti interni interpolati linearmente
       n==3 : triangolo (apice = TL=TR, base = BL/BR)
@@ -382,6 +435,30 @@ def _poly_to_bezier(pts):
     pts = dedup
     n = len(pts)
 
+    if n == 1:
+        p0 = pts[0]
+        return [p0[0], p0[1]] * 8
+
+    if n == 2:
+        p0, p3 = pts[0], pts[1]
+        top_p0 = p0
+        top_p3 = p3
+        top_p1 = _lerp(p0, p3, 1.0 / 3.0)
+        top_p2 = _lerp(p0, p3, 2.0 / 3.0)
+        bot_p0, bot_p3 = top_p3, top_p0
+        bot_p1, bot_p2 = top_p2, top_p1
+        bezier = [coord for p in [top_p0, top_p1, top_p2, top_p3,
+                                  bot_p0, bot_p1, bot_p2, bot_p3]
+                  for coord in p]
+        return bezier
+
+    # --- PULIZIA POLIGONO (n >= 3) ---
+    # Valida con make_valid_poly e semplifica con simplify_polygon (Douglas-Peucker)
+    # prima di procedere con qualsiasi fitting o riordinamento dei vertici.
+    pts = _clean_polygon(pts, eps=1.0)
+    n = len(pts)
+
+    # Dopo la pulizia potremmo avere meno punti: ri-controlla i casi degeneri
     if n == 1:
         p0 = pts[0]
         return [p0[0], p0[1]] * 8
@@ -584,9 +661,9 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
       Punti 0-3: curva cubica TOP  (TL -> TR, da sinistra a destra)
       Punti 4-7: curva cubica BOT  (BR -> BL, da destra a sinistra)
 
-      Per n > 4 il fitting e' eseguito da BezierCurve (adet/utils/curve_utils)
-      tramite pseudoinversa della matrice di Bernstein, identico al metodo
-      usato nel pipeline SemiETS per i dataset CTW1500 e TotalText.
+      Per n >= 3 i vertici del poligono vengono prima validati e semplificati
+      da _clean_polygon() (make_valid_poly + Douglas-Peucker), poi fittati
+      con BezierCurve (adet/utils/curve_utils) per n > 4.
 
     Struttura bbox (convenzione CTW1500):
       Calcolata come min/max degli 8 punti di controllo bezier (NON dei
@@ -640,8 +717,9 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                         n_absolute += 1
 
                     # --- bezier_pts ---
-                    # _poly_to_bezier usa BezierCurve (curve_utils) per n>4,
-                    # con fallback bbox per self-intersection.
+                    # _poly_to_bezier ora pulisce il poligono con _clean_polygon()
+                    # (make_valid_poly + simplify_polygon Douglas-Peucker) prima
+                    # di qualsiasi fitting o riordinamento dei vertici.
                     bezier = _poly_to_bezier(pts)
 
                     # --- bbox: min/max sugli 8 punti di controllo bezier, clippato ---
