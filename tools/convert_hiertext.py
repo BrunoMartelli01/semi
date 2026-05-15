@@ -43,17 +43,7 @@ CATEGORIES = [{
 
 
 def text_to_rec(text, max_len=MAX_LEN):
-    """
-    Encode text using DeepSolo/SemiETS 96-voc format.
-
-    Mapping:
-      ASCII printable chars (space=32 ... ~=126) -> 0..94
-      blank/unknown is reserved at 95 and is NOT written into GT rec
-      padding sentinel is 96
-
-    Characters outside the printable ASCII range are ignored.
-    Output length is fixed to max_len with PAD_TOKEN=96.
-    """
+    """Encode text using DeepSolo/SemiETS 96-voc format."""
     rec = []
     for c in str(text).strip():
         if c in CTLABELS:
@@ -143,7 +133,7 @@ def _split_polygon_top_bottom(poly_xy):
 
     mask = []
     for p in bottom_chain:
-        if (np.allclose(p, top_start) or np.allclose(p, top_end)):
+        if np.allclose(p, top_start) or np.allclose(p, top_end):
             mask.append(False)
         else:
             mask.append(True)
@@ -175,19 +165,49 @@ def _resample_chain(chain_xy, num_samples=20):
 
 
 def _fit_cubic_bezier(chain_xy):
-    """Fit di una cubica di Bezier (4 ctrl points) ai punti chain_xy.
+    """Fit robusto di una cubica di Bezier (4 ctrl points) ai punti chain_xy.
 
-    Usa BezierCurve.get_middle_control_points per ottenere i punti di controllo,
-    come in altre parti del codice (pytorch-auto-drive).
+    In casi degeneri (tutti i punti coincidenti o quasi) fa fallback a una
+    semplice retta dai primi agli ultimi punti, evitando errori di SVD.
     """
     chain_xy = np.asarray(chain_xy, dtype=np.float32)
+    n = chain_xy.shape[0]
+    if n == 0:
+        p = np.array([0.0, 0.0], dtype=np.float32)
+        return np.stack([p, p, p, p], axis=0)
+    if n == 1:
+        p = chain_xy[0]
+        return np.stack([p, p, p, p], axis=0)
+
     x = chain_xy[:, 0]
     y = chain_xy[:, 1]
 
-    bez = BezierCurve(order=3, num_sample_points=len(chain_xy))
-    flat_cp = bez.get_middle_control_points(x, y)
-    cp = np.array(flat_cp, dtype=np.float32).reshape(4, 2)
-    return cp
+    # Controlla degenerazione: lunghezze segmento quasi nulle
+    dx = np.diff(x)
+    dy = np.diff(y)
+    dt = np.sqrt(dx ** 2 + dy ** 2)
+    if dt.sum() < 1e-6:
+        # Tutti i punti quasi coincidenti -> retta degenerata
+        p0 = chain_xy[0]
+        p3 = chain_xy[-1]
+        v = (p3 - p0) / 3.0
+        p1 = p0 + v
+        p2 = p0 + 2.0 * v
+        return np.stack([p0, p1, p2, p3], axis=0)
+
+    try:
+        bez = BezierCurve(order=3, num_sample_points=n)
+        flat_cp = bez.get_middle_control_points(x, y)
+        cp = np.array(flat_cp, dtype=np.float32).reshape(4, 2)
+        return cp
+    except Exception:
+        # Fallback robusto in caso di problemi numerici/SVD
+        p0 = chain_xy[0]
+        p3 = chain_xy[-1]
+        v = (p3 - p0) / 3.0
+        p1 = p0 + v
+        p2 = p0 + 2.0 * v
+        return np.stack([p0, p1, p2, p3], axis=0)
 
 
 def _poly_to_bezier(poly_xy):
@@ -211,15 +231,14 @@ def _poly_to_bezier(poly_xy):
     top_chain_s = _resample_chain(top_chain, num_samples=20)
     bottom_chain_s = _resample_chain(bottom_chain, num_samples=20)
 
-    # fit libero
-    top_cp_free = _fit_cubic_bezier(top_chain_s)
+    # fit robusto
+    top_cp = _fit_cubic_bezier(top_chain_s)
     bot_cp_free = _fit_cubic_bezier(bottom_chain_s)
 
     # forza il primo/ultimo ctrl point a coincidere con l'estremo della catena
     # TOP: sinistra -> destra
     top_p0 = top_chain_s[0]
     top_p3 = top_chain_s[-1]
-    top_cp = top_cp_free.copy()
     top_cp[0] = top_p0
     top_cp[3] = top_p3
 
@@ -248,17 +267,10 @@ def _poly_to_bezier(poly_xy):
 # ---------------------------------------------------------------------------
 
 def _read_jsonl(jsonl_path):
-    """
-    Legge un file HierText .jsonl.
-
-    HierText usa un formato ibrido: il file contiene UN singolo oggetto JSON
-    con chiave 'annotations' che contiene la lista di tutte le immagini.
-    In alternativa, supporta anche il formato JSON Lines puro (un oggetto per riga).
-    """
+    """Legge un file HierText .jsonl (JSON unico o JSON Lines)."""
     with open(jsonl_path, 'r', encoding='utf-8') as f:
         raw = f.read().strip()
 
-    # Prova prima come singolo oggetto JSON (formato HierText standard)
     try:
         data = json.loads(raw)
         if isinstance(data, dict) and "annotations" in data:
@@ -268,7 +280,6 @@ def _read_jsonl(jsonl_path):
     except json.JSONDecodeError:
         pass
 
-    # Fallback: formato JSON Lines (una riga = un oggetto)
     samples = []
     for line in raw.splitlines():
         line = line.strip()
@@ -282,30 +293,7 @@ def _read_jsonl(jsonl_path):
 # ---------------------------------------------------------------------------
 
 def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
-    """
-    Convert HierText annotations to the COCO-like format expected by DeepSolo/SemiETS,
-    identico allo schema di datasets/ctw1500/train_96voc.json.
-
-    Formato output per ogni annotazione:
-      {
-        "image_id": <int>,
-        "area": <float>,
-        "category_id": 1,
-        "iscrowd": 0,
-        "id": <int>,
-        "bezier_pts": [x0,y0, x1,y1, ..., x7,y7],   # 8 punti = 16 valori
-        "rec": [int * 100],                         # lunghezza 100, PAD=96
-        "bbox": [x_min, y_min, width, height]       # XYWH_ABS, clippato a [0, img_wh]
-      }
-
-    Campi NON presenti (rimossi rispetto alla versione precedente):
-      - "segmentation"  (non esiste in CTW1500)
-      - "text"          (non esiste in CTW1500 supervised)
-      - "ignore"        (non esiste in CTW1500)
-
-    Struttura "images" identica a CTW1500:
-      {width, date_captured, license, flickr_url, file_name, id, coco_url, height}
-    """
+    """Converti HierText nel formato COCO-like usato da DeepSolo/SemiETS."""
     samples = _read_jsonl(jsonl_path)
 
     images, annotations_all = [], []
@@ -319,7 +307,6 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
         img_w = sample.get("image_width", 0)
         img_h = sample.get("image_height", 0)
 
-        # Struttura images identica a CTW1500
         images.append({
             "width": img_w,
             "date_captured": "",
@@ -338,7 +325,6 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     if len(verts) < 3:
                         continue
 
-                    # --- converti vertices in pixel assoluti ---
                     poly_xy, mode = _vertices_to_pixels(verts, img_w, img_h)
                     poly_xy = np.asarray(poly_xy, dtype=np.float32)
                     if len(poly_xy) < 3:
@@ -349,11 +335,9 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     else:
                         n_absolute += 1
 
-                    # clip minimo per sicurezza
                     poly_xy[:, 0] = np.clip(poly_xy[:, 0], 0, img_w - 1)
                     poly_xy[:, 1] = np.clip(poly_xy[:, 1], 0, img_h - 1)
 
-                    # bbox XYWH_ABS
                     x_min = float(np.min(poly_xy[:, 0]))
                     y_min = float(np.min(poly_xy[:, 1]))
                     x_max = float(np.max(poly_xy[:, 0]))
@@ -364,10 +348,8 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     area = float(w * h)
                     bbox_samples.append((w, h))
 
-                    # --- poligono -> punti di controllo Bezier (4 top + 4 bottom) ---
                     bezier = _poly_to_bezier(poly_xy)
 
-                    # 96-voc rec con MAX_LEN=100 (come CTW1500)
                     text_orig = str(word.get("text", ""))
                     legible = word.get("legible", True)
                     text_norm = text_orig.strip()
@@ -385,7 +367,6 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                         "bezier_pts": bezier,
                         "rec": rec,
                         "bbox": bbox,
-                        # campi interni (rimossi al momento della scrittura)
                         "_ignore": ignore,
                         "_text": text_norm,
                     }
@@ -403,12 +384,9 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
         d["text"] = ann["_text"]
         return d
 
-    annotations_supervised = [
-        _clean(ann) for ann in annotations_all if ann["_ignore"] == 0
-    ]
+    annotations_supervised = [_clean(ann) for ann in annotations_all if ann["_ignore"] == 0]
     annotations_gt = [_clean_with_text(ann) for ann in annotations_all]
 
-    # --- supervised (no text, no ignore, no segmentation) ---
     coco_supervised = {
         "images": images,
         "annotations": annotations_supervised,
@@ -417,7 +395,6 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
     with open(out_json_path, 'w', encoding='utf-8') as f:
         json.dump(coco_supervised, f)
 
-    # --- gt_source: tutte le annotazioni + campo text per evaluation ---
     coco_gt_source = {
         "images": images,
         "annotations": annotations_gt,
@@ -470,6 +447,7 @@ def make_semi_splits(images, annotations_all, label_ratio, out_dir,
             "annotations": split_anns,
             "categories": CATEGORIES,
         }
+
     if label_ratio * 100 >= 1:
         ratio_str = str(int(label_ratio * 100))
     else:
@@ -541,7 +519,7 @@ if __name__ == "__main__":
         mean_w = float(np.mean(bboxes[:, 2])) if bboxes.size else 0.0
         mean_h = float(np.mean(bboxes[:, 3])) if bboxes.size else 0.0
 
-        bez_lens = [len(a["bezier_pts"]) for a in anns] if anns else []
+        bez_lens = [len(a["bezier_pts"]) for a in anns]) if anns else []
         wrong_bez = sum(1 for l in bez_lens if l != 16)
 
         status = []
@@ -569,5 +547,4 @@ if __name__ == "__main__":
             status.append(f"ERRORE: {wrong_bez} bezier_pts con lunghezza != 16")
 
         result = "OK" if not status else " | ".join(status)
-        print(f"  [{label}]  img={len(d['images'])}  ann={len(anns)}  "
-              f"rec_len={MAX_LEN}  bbox_mean=[w={mean_w:.1f}, h={mean_h:.1f}]  -> {result}")
+        print(f"  [{label}]  img={len(d['images'])}  ann={len(anns)}  rec_len={MAX_LEN}  bbox_mean=[w={mean_w:.1f}, h={mean_h:.1f}]  -> {result}")
