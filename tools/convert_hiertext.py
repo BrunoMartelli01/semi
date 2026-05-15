@@ -90,29 +90,71 @@ def _vertices_to_pixels(verts, img_w, img_h):
     return pts, mode
 
 
+def _principal_axes(pts):
+    """Calcola l'asse principale (direzione di lettura) e l'asse perpendicolare
+    del poligono tramite PCA sui vertici.
+
+    Ritorna:
+      axis_main  : np.ndarray (2,) - versore dell'asse principale (piu' lungo)
+      axis_perp  : np.ndarray (2,) - versore perpendicolare (oriented verso il basso)
+
+    L'asse principale e' orientato in modo che la sua componente x sia >= 0
+    (cioe' punta "verso destra"), garantendo che l'estremo sinistro abbia
+    proiezione minore di quello destro.
+    L'asse perpendicolare e' orientato in modo che la sua componente y >= 0
+    (cioe' punta "verso il basso" nello spazio immagine), in modo che la
+    catena con centroide proiettato positivo sull'asse perp. sia la bottom.
+    """
+    centered = pts - pts.mean(axis=0)
+    cov = centered.T @ centered / len(pts)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    # eigh ritorna autovalori in ordine crescente; il piu' grande e' l'asse principale
+    axis_main = eigenvectors[:, -1].astype(np.float64)
+    axis_perp = eigenvectors[:, 0].astype(np.float64)
+
+    # Orienta axis_main verso destra (componente x >= 0)
+    if axis_main[0] < 0:
+        axis_main = -axis_main
+
+    # Orienta axis_perp verso il basso (componente y >= 0 nello spazio immagine
+    # dove y cresce verso il basso)
+    if axis_perp[1] < 0:
+        axis_perp = -axis_perp
+
+    return axis_main, axis_perp
+
+
 def _split_polygon_top_bottom(poly_xy):
     """Divide un poligono chiuso in catena superiore e inferiore.
 
     poly_xy: array-like (N, 2) in pixel.
     Restituisce: top_chain, bottom_chain (entrambi np.ndarray (M,2), M>=2).
 
-    Strategia: usa make_valid_poly per correggere self-intersection e
-    orientazione, poi prende i vertici dalla boundary principale e li
-    spezza tra xmin e xmax.
-    La catena con y_media minore e' considerata "top".
+    Algoritmo robusto basato su PCA:
+    1. Calcola l'asse principale del poligono tramite PCA (rappresenta la
+       direzione di lettura, robusta a rotazioni e inclinazioni del testo).
+    2. Proietta tutti i vertici sull'asse principale per trovare gli estremi
+       "sinistro" (proj minima) e "destro" (proj massima) nel riferimento
+       allineato con il testo, invece di usare semplicemente argmin(x).
+    3. Spezza il contorno del poligono nei due estremi trovati, producendo
+       due catene di vertici.
+    4. Assegna top/bottom in base alla proiezione del centroide di ciascuna
+       catena sull'asse perpendicolare (orientato verso il basso): la catena
+       con centroide a proiezione perpendicolare piu' bassa e' la top.
 
-    Disgiunzione stretta: top_chain include i vertici estremi sinistro e
-    destro (left_idx, right_idx); bottom_chain e' costruita escludendo per
-    indice questi due estremi, in modo che le due catene non condividano
-    mai alcun vertice.  Questo e' garantito dalla selezione degli indici,
-    senza fare affidamento su np.allclose (che puo' fallire dopo
-    make_valid_poly a causa di perturbazioni floating-point).
+    Disgiunzione stretta: top_chain include i vertici degli estremi;
+    bottom_chain e' costruita escludendo per indice quegli estremi, senza
+    alcun confronto floating-point (np.allclose).
 
-    I punti di controllo iniziale/finale di ciascuna curva Bezier
-    devono coincidere con i vertici estremi della rispettiva catena:
-    questa funzione restituisce le catene grezze (non ricampionate) in
-    modo che _poly_to_bezier possa ancorare i ctrl-pts ai vertici
-    originali prima del resample.
+    Robustezza rispetto al criterio precedente argmin(x)/argmax(x) + mean-Y:
+    - Funziona correttamente su testi ruotati, inclinati o obliqui.
+    - Non confonde l'estremo sinistro con un vertice della catena superiore
+      quando il testo e' molto inclinato.
+    - L'asse perp orientato garantisce che top sia sempre la catena verso
+      l'alto dell'immagine, indipendentemente dall'inclinazione.
+
+    Casi degeneri: se il poligono ha <= 2 vertici entrambe le catene
+    coincidono con i punti disponibili.
     """
     poly = make_valid_poly(poly_xy.tolist())
     xs, ys = poly.exterior.xy
@@ -121,34 +163,45 @@ def _split_polygon_top_bottom(poly_xy):
     if len(pts) <= 2:
         return pts, pts
 
-    left_idx = int(np.argmin(pts[:, 0]))
-    right_idx = int(np.argmax(pts[:, 0]))
+    # --- PCA per trovare l'asse principale del testo ---
+    axis_main, axis_perp = _principal_axes(pts)
+
+    # Proietta i vertici sull'asse principale
+    proj_main = pts @ axis_main
+
+    left_idx  = int(np.argmin(proj_main))  # estremo "sinistro" nel ref. ruotato
+    right_idx = int(np.argmax(proj_main))  # estremo "destro" nel ref. ruotato
 
     N = len(pts)
 
-    if left_idx < right_idx:
-        # chain con indici crescenti: left -> right (include entrambi gli estremi)
-        chain1 = pts[left_idx:right_idx + 1]
-        # chain wrapping: right+1 ... N-1, 0 ... left-1
-        # ESCLUDI right_idx e left_idx per disgiunzione stretta
-        chain2_indices = list(range(right_idx + 1, N)) + list(range(0, left_idx))
-        if len(chain2_indices) >= 2:
-            chain2 = pts[chain2_indices]
-        else:
-            # catena troppo corta: usa i due estremi come fallback
-            chain2 = pts[[right_idx, left_idx]]
-    else:
-        # chain con indici crescenti: left -> N-1, 0 -> right
-        chain1 = np.vstack([pts[left_idx:], pts[:right_idx + 1]])
-        # chain interna: right+1 ... left-1
-        # ESCLUDI right_idx e left_idx per disgiunzione stretta
-        chain2_indices = list(range(right_idx + 1, left_idx))
-        if len(chain2_indices) >= 2:
-            chain2 = pts[chain2_indices]
-        else:
-            chain2 = pts[[right_idx, left_idx]]
+    if left_idx == right_idx:
+        # Poligono degenere: tutti i punti allineati sull'asse perp
+        return pts, pts
 
-    if chain1[:, 1].mean() <= chain2[:, 1].mean():
+    if left_idx < right_idx:
+        # chain1: left -> right  (include entrambi gli estremi)
+        chain1 = pts[left_idx:right_idx + 1]
+        # chain2: right+1 ... N-1, 0 ... left-1  (ESCLUDI gli estremi)
+        idx2 = list(range(right_idx + 1, N)) + list(range(0, left_idx))
+    else:
+        # chain1: left -> N-1, 0 -> right  (include entrambi gli estremi)
+        chain1 = np.vstack([pts[left_idx:], pts[:right_idx + 1]])
+        # chain2: right+1 ... left-1  (ESCLUDI gli estremi)
+        idx2 = list(range(right_idx + 1, left_idx))
+
+    if len(idx2) >= 2:
+        chain2 = pts[idx2]
+    else:
+        # catena troppo corta: duplica gli estremi come fallback
+        chain2 = pts[[left_idx, right_idx]]
+
+    # --- Assegna top/bottom via proiezione sull'asse perpendicolare ---
+    # axis_perp e' orientato verso il basso (y cresce): centroide con
+    # proiezione perp piu' BASSA e' la catena superiore (top).
+    c1_perp = float((chain1 @ axis_perp).mean())
+    c2_perp = float((chain2 @ axis_perp).mean())
+
+    if c1_perp <= c2_perp:
         top_chain, bottom_chain = chain1, chain2
     else:
         top_chain, bottom_chain = chain2, chain1
