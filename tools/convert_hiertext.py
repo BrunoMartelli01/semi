@@ -108,7 +108,7 @@ def _split_polygon_top_bottom(poly_xy):
 
     Strategia: usa make_valid_poly per correggere self-intersection e orientazione,
     poi prende i vertici dalla boundary principale e li spezza tra xmin e xmax.
-    La catena con y_media minore e' considerata "top".[cite:6]
+    La catena con y_media minore e' considerata "top".
     """
     poly = make_valid_poly(poly_xy.tolist())
     xs, ys = poly.exterior.xy
@@ -158,7 +158,7 @@ def _fit_cubic_bezier(chain_xy):
     """Fit di una cubica di Bezier (4 ctrl points) ai punti chain_xy.
 
     Usa BezierCurve.get_middle_control_points per ottenere i punti di controllo,
-    come in altre parti del codice (pytorch-auto-drive).[cite:7]
+    come in altre parti del codice (pytorch-auto-drive).
     """
     chain_xy = np.asarray(chain_xy, dtype=np.float32)
     x = chain_xy[:, 0]
@@ -178,9 +178,9 @@ def _poly_to_bezier(poly_xy):
       [TOP_p0, TOP_p1, TOP_p2, TOP_p3, BOT_p0, BOT_p1, BOT_p2, BOT_p3]
     con 4 punti di controllo per la parte alta e 4 per la parte bassa.
 
-    Garantisce, per quanto possibile, che le due curve non si auto-intersechino:
-    in caso di problemi di fit (p.es. poligoni molto strani) ripiega su due
-    linee quasi rette (top/bottom) tra i bordi sinistro e destro del poligono.
+    Primo/ultimo punto di controllo coincidono sempre con i vertici estremi
+    della catena superiore/inferiore. I due punti centrali sono stimati via
+    least-squares usando BezierCurve, ma forzando il vincolo agli estremi.
     """
     poly_xy = np.asarray(poly_xy, dtype=np.float32)
     if len(poly_xy) < 2:
@@ -191,34 +191,34 @@ def _poly_to_bezier(poly_xy):
     top_chain_s = _resample_chain(top_chain, num_samples=20)
     bottom_chain_s = _resample_chain(bottom_chain, num_samples=20)
 
-    top_cp = _fit_cubic_bezier(top_chain_s)
-    bottom_cp = _fit_cubic_bezier(bottom_chain_s)
+    # fit libero
+    top_cp_free = _fit_cubic_bezier(top_chain_s)
+    bot_cp_free = _fit_cubic_bezier(bottom_chain_s)
 
-    # Heuristica per evitare incroci grossolani: imponi monotonia in x
-    # (p0.x <= p1.x <= p2.x <= p3.x) sulla top e decrescente sulla bottom.
-    top_cp = top_cp.copy()
-    bottom_cp = bottom_cp.copy()
+    # forza il primo/ultimo ctrl point a coincidere con l'estremo della catena
+    # TOP: sinistra -> destra
+    top_p0 = top_chain_s[0]
+    top_p3 = top_chain_s[-1]
+    top_cp = top_cp_free.copy()
+    top_cp[0] = top_p0
+    top_cp[3] = top_p3
 
-    top_cp[:, 0] = np.clip(top_cp[:, 0], poly_xy[:, 0].min(), poly_xy[:, 0].max())
-    bottom_cp[:, 0] = np.clip(bottom_cp[:, 0], poly_xy[:, 0].min(), poly_xy[:, 0].max())
+    # BOT: destra -> sinistra (per compatibilita' con create_gt_hiertext)
+    bot_chain_s_rev = bottom_chain_s[::-1]
+    bot_p0 = bot_chain_s_rev[0]
+    bot_p3 = bot_chain_s_rev[-1]
+    bot_cp = bot_cp_free.copy()
+    bot_cp[0] = bot_p0
+    bot_cp[3] = bot_p3
 
-    # se l'ordinamento in x e' errato, ordina i cp lungo x
-    if not np.all(np.diff(top_cp[:, 0]) >= -1e-3):
-        top_cp = top_cp[np.argsort(top_cp[:, 0])]
-    if not np.all(np.diff(bottom_cp[:, 0]) <= 1e-3):
-        bottom_cp = bottom_cp[np.argsort(bottom_cp[:, 0])[::-1]]
+    # clamp per sicurezza dentro il bounding box del poligono
+    x_min, x_max = float(poly_xy[:, 0].min()), float(poly_xy[:, 0].max())
+    y_min, y_max = float(poly_xy[:, 1].min()), float(poly_xy[:, 1].max())
+    for cp in (top_cp, bot_cp):
+        cp[:, 0] = np.clip(cp[:, 0], x_min, x_max)
+        cp[:, 1] = np.clip(cp[:, 1], y_min, y_max)
 
-    # fallback: se dopo tutto questo le curve sono praticamente piatte, usa
-    # due linee orizzontali medie per garantire stabilita'.
-    span_x = float(poly_xy[:, 0].max() - poly_xy[:, 0].min())
-    if span_x < 1e-3:
-        x0 = float(poly_xy[:, 0].mean())
-        y_top = float(top_chain_s[:, 1].mean())
-        y_bot = float(bottom_chain_s[:, 1].mean())
-        top_cp = np.array([[x0, y_top]] * 4, dtype=np.float32)
-        bottom_cp = np.array([[x0, y_bot]] * 4, dtype=np.float32)
-
-    bez = np.concatenate([top_cp.reshape(-1), bottom_cp.reshape(-1)]).astype(float)
+    bez = np.concatenate([top_cp.reshape(-1), bot_cp.reshape(-1)]).astype(float)
     assert bez.shape[0] == 16
     return bez.tolist()
 
