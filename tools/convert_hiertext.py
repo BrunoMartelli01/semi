@@ -66,6 +66,166 @@ def text_to_rec(text, max_len=MAX_LEN):
     return rec
 
 
+# ---------------------------------------------------------------------------
+# Geometry helpers: vertices -> pixels, polygon -> Bezier
+# ---------------------------------------------------------------------------
+
+def _vertices_to_pixels(verts, img_w, img_h):
+    """Converte i vertices di HierText in coordinate pixel assolute.
+
+    HierText puo' usare due convenzioni:
+      - assolute:  {"x": 123, "y": 45}
+      - normalizzate: {"x": 0.1,  "y": 0.2}   (0..1)
+
+    Questa funzione ritorna:
+      pts : lista [(x,y), ...] in pixel
+      mode: 'absolute' oppure 'normalized'
+    """
+    pts = []
+    max_xy = 0.0
+    for v in verts:
+        if isinstance(v, dict):
+            x, y = float(v["x"]), float(v["y"])
+        else:
+            x, y = float(v[0]), float(v[1])
+        pts.append([x, y])
+        max_xy = max(max_xy, abs(x), abs(y))
+
+    mode = "absolute"
+    if max_xy <= 1.5 and img_w > 1 and img_h > 1:  # vertices normalizzati
+        mode = "normalized"
+        for p in pts:
+            p[0] *= img_w
+            p[1] *= img_h
+    return pts, mode
+
+
+def _split_polygon_top_bottom(poly_xy):
+    """Divide un poligono chiuso in catena superiore e inferiore.
+
+    poly_xy: array-like (N, 2) in pixel.
+    Restituisce: top_chain, bottom_chain (entrambi np.ndarray (M,2), M>=2).
+
+    Strategia: usa make_valid_poly per correggere self-intersection e orientazione,
+    poi prende i vertici dalla boundary principale e li spezza tra xmin e xmax.
+    La catena con y_media minore e' considerata "top".[cite:6]
+    """
+    poly = make_valid_poly(poly_xy.tolist())
+    xs, ys = poly.exterior.xy
+    pts = np.stack([xs, ys], axis=1)[:-1]  # rimuovi duplicato finale
+
+    if len(pts) <= 2:
+        return pts, pts
+
+    left_idx = int(np.argmin(pts[:, 0]))
+    right_idx = int(np.argmax(pts[:, 0]))
+
+    if left_idx < right_idx:
+        chain1 = pts[left_idx:right_idx + 1]
+        chain2 = np.vstack([pts[right_idx:], pts[:left_idx + 1]])
+    else:
+        chain1 = np.vstack([pts[left_idx:], pts[:right_idx + 1]])
+        chain2 = pts[right_idx:left_idx + 1]
+
+    if chain1[:, 1].mean() <= chain2[:, 1].mean():
+        top_chain, bottom_chain = chain1, chain2
+    else:
+        top_chain, bottom_chain = chain2, chain1
+
+    return top_chain, bottom_chain
+
+
+def _resample_chain(chain_xy, num_samples=20):
+    """Resampling uniforme lungo la lunghezza della polilinea."""
+    chain_xy = np.asarray(chain_xy, dtype=np.float32)
+    if len(chain_xy) < 2:
+        return np.repeat(chain_xy[:1], num_samples, axis=0)
+
+    deltas = np.diff(chain_xy, axis=0)
+    seg_len = np.sqrt((deltas ** 2).sum(axis=1))
+    t = np.concatenate([[0.0], np.cumsum(seg_len)])
+    if t[-1] == 0:
+        return np.repeat(chain_xy[:1], num_samples, axis=0)
+    t /= t[-1]
+
+    u = np.linspace(0.0, 1.0, num_samples)
+    xs = np.interp(u, t, chain_xy[:, 0])
+    ys = np.interp(u, t, chain_xy[:, 1])
+    return np.stack([xs, ys], axis=1)
+
+
+def _fit_cubic_bezier(chain_xy):
+    """Fit di una cubica di Bezier (4 ctrl points) ai punti chain_xy.
+
+    Usa BezierCurve.get_middle_control_points per ottenere i punti di controllo,
+    come in altre parti del codice (pytorch-auto-drive).[cite:7]
+    """
+    chain_xy = np.asarray(chain_xy, dtype=np.float32)
+    x = chain_xy[:, 0]
+    y = chain_xy[:, 1]
+
+    bez = BezierCurve(order=3, num_sample_points=len(chain_xy))
+    flat_cp = bez.get_middle_control_points(x, y)
+    cp = np.array(flat_cp, dtype=np.float32).reshape(4, 2)
+    return cp
+
+
+def _poly_to_bezier(poly_xy):
+    """Converte un poligono HierText in 2 curve di Bezier (top+bottom).
+
+    poly_xy: lista/array (N,2) in pixel assoluti.
+    Restituisce una lista di 16 float:
+      [TOP_p0, TOP_p1, TOP_p2, TOP_p3, BOT_p0, BOT_p1, BOT_p2, BOT_p3]
+    con 4 punti di controllo per la parte alta e 4 per la parte bassa.
+
+    Garantisce, per quanto possibile, che le due curve non si auto-intersechino:
+    in caso di problemi di fit (p.es. poligoni molto strani) ripiega su due
+    linee quasi rette (top/bottom) tra i bordi sinistro e destro del poligono.
+    """
+    poly_xy = np.asarray(poly_xy, dtype=np.float32)
+    if len(poly_xy) < 2:
+        p = poly_xy[0] if len(poly_xy) else np.array([0.0, 0.0], dtype=np.float32)
+        return [float(p[0])] * 8 + [float(p[1])] * 8
+
+    top_chain, bottom_chain = _split_polygon_top_bottom(poly_xy)
+    top_chain_s = _resample_chain(top_chain, num_samples=20)
+    bottom_chain_s = _resample_chain(bottom_chain, num_samples=20)
+
+    top_cp = _fit_cubic_bezier(top_chain_s)
+    bottom_cp = _fit_cubic_bezier(bottom_chain_s)
+
+    # Heuristica per evitare incroci grossolani: imponi monotonia in x
+    # (p0.x <= p1.x <= p2.x <= p3.x) sulla top e decrescente sulla bottom.
+    top_cp = top_cp.copy()
+    bottom_cp = bottom_cp.copy()
+
+    top_cp[:, 0] = np.clip(top_cp[:, 0], poly_xy[:, 0].min(), poly_xy[:, 0].max())
+    bottom_cp[:, 0] = np.clip(bottom_cp[:, 0], poly_xy[:, 0].min(), poly_xy[:, 0].max())
+
+    # se l'ordinamento in x e' errato, ordina i cp lungo x
+    if not np.all(np.diff(top_cp[:, 0]) >= -1e-3):
+        top_cp = top_cp[np.argsort(top_cp[:, 0])]
+    if not np.all(np.diff(bottom_cp[:, 0]) <= 1e-3):
+        bottom_cp = bottom_cp[np.argsort(bottom_cp[:, 0])[::-1]]
+
+    # fallback: se dopo tutto questo le curve sono praticamente piatte, usa
+    # due linee orizzontali medie per garantire stabilita'.
+    span_x = float(poly_xy[:, 0].max() - poly_xy[:, 0].min())
+    if span_x < 1e-3:
+        x0 = float(poly_xy[:, 0].mean())
+        y_top = float(top_chain_s[:, 1].mean())
+        y_bot = float(bottom_chain_s[:, 1].mean())
+        top_cp = np.array([[x0, y_top]] * 4, dtype=np.float32)
+        bottom_cp = np.array([[x0, y_bot]] * 4, dtype=np.float32)
+
+    bez = np.concatenate([top_cp.reshape(-1), bottom_cp.reshape(-1)]).astype(float)
+    assert bez.shape[0] == 16
+    return bez.tolist()
+
+
+# ---------------------------------------------------------------------------
+# JSON reading
+# ---------------------------------------------------------------------------
 
 def _read_jsonl(jsonl_path):
     """
@@ -97,6 +257,10 @@ def _read_jsonl(jsonl_path):
     return samples
 
 
+# ---------------------------------------------------------------------------
+# Main conversion
+# ---------------------------------------------------------------------------
+
 def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
     """
     Convert HierText annotations to the COCO-like format expected by DeepSolo/SemiETS,
@@ -110,10 +274,9 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
         "iscrowd": 0,
         "id": <int>,
         "bezier_pts": [x0,y0, x1,y1, ..., x7,y7],   # 8 punti = 16 valori
-        "rec": [int * 100],                           # lunghezza 100, PAD=96
-        "bbox": [x_min, y_min, width, height]         # XYWH_ABS, clippato a [0, img_wh]
+        "rec": [int * 100],                         # lunghezza 100, PAD=96
+        "bbox": [x_min, y_min, width, height]       # XYWH_ABS, clippato a [0, img_wh]
       }
-
 
     Campi NON presenti (rimossi rispetto alla versione precedente):
       - "segmentation"  (non esiste in CTW1500)
@@ -156,7 +319,33 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                         continue
 
                     # --- converti vertices in pixel assoluti ---
+                    poly_xy, mode = _vertices_to_pixels(verts, img_w, img_h)
+                    poly_xy = np.asarray(poly_xy, dtype=np.float32)
+                    if len(poly_xy) < 3:
+                        continue
 
+                    if mode == "normalized":
+                        n_normalized += 1
+                    else:
+                        n_absolute += 1
+
+                    # clip minimo per sicurezza
+                    poly_xy[:, 0] = np.clip(poly_xy[:, 0], 0, img_w - 1)
+                    poly_xy[:, 1] = np.clip(poly_xy[:, 1], 0, img_h - 1)
+
+                    # bbox XYWH_ABS
+                    x_min = float(np.min(poly_xy[:, 0]))
+                    y_min = float(np.min(poly_xy[:, 1]))
+                    x_max = float(np.max(poly_xy[:, 0]))
+                    y_max = float(np.max(poly_xy[:, 1]))
+                    w = max(1.0, x_max - x_min)
+                    h = max(1.0, y_max - y_min)
+                    bbox = [x_min, y_min, w, h]
+                    area = float(w * h)
+                    bbox_samples.append((w, h))
+
+                    # --- poligono -> punti di controllo Bezier (4 top + 4 bottom) ---
+                    bezier = _poly_to_bezier(poly_xy)
 
                     # 96-voc rec con MAX_LEN=100 (come CTW1500)
                     text_orig = str(word.get("text", ""))
@@ -166,8 +355,6 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
 
                     has_real_text = any(t != PAD_TOKEN for t in rec)
                     ignore = 1 if (not legible) or (not has_real_text) else 0
-
-
 
                     ann = {
                         "image_id": img_id,
@@ -185,9 +372,8 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     annotations_all.append(ann)
                     ann_id += 1
 
-
-
-
+    print(f"  vertices normalizzati: {n_normalized}")
+    print(f"  vertices assoluti:    {n_absolute}")
 
     def _clean(ann):
         return {k: v for k, v in ann.items() if not k.startswith("_")}
@@ -228,6 +414,10 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
 
     return images, annotations_all, annotations_supervised
 
+
+# ---------------------------------------------------------------------------
+# Semi-supervised splits (labeled / unlabeled)
+# ---------------------------------------------------------------------------
 
 def make_semi_splits(images, annotations_all, label_ratio, out_dir,
                      split_name="train_96voc", seed=42):
