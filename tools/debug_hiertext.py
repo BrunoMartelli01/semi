@@ -1,15 +1,14 @@
 import argparse
 import json
+import math
 from pathlib import Path
 from collections import defaultdict
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 # ---------------------------------------------------------------------------
 # Vocabolari supportati
-# ---------------------------------------------------------------------------
-# 96-voc: 95 caratteri ASCII stampabili (spazio=0, '!'=1, ..., '~'=94) + 1 blank
-# 37-voc: legacy [a-z, 0-9] + 1 blank
 # ---------------------------------------------------------------------------
 CTLABELS_96 = [chr(i) for i in range(32, 127)]   # 95 chars, blank=95, pad=96
 CTLABELS_37 = ['a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p',
@@ -18,21 +17,19 @@ CTLABELS_37 = ['a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p',
 
 
 def build_vocab(voc_size: int):
-    """Return (CTLABELS, BLANK_TOKEN, PAD_TOKEN) for the given voc_size."""
     if voc_size == 96:
         labels = CTLABELS_96
     elif voc_size == 37:
         labels = CTLABELS_37
     else:
         raise ValueError(f"Unsupported voc_size {voc_size}. Use 96 or 37.")
-    blank = len(labels)          # 95 for 96-voc, 36 for 37-voc
-    pad   = len(labels) + 1      # 96 for 96-voc, 37 for 37-voc  (== voc_size)
+    blank = len(labels)
+    pad   = len(labels) + 1
     return labels, blank, pad
 
 
 def text_to_rec(text: str, ctlabels, pad_token: int, max_len: int = 25,
                 lowercase: bool = False) -> list:
-    """Encode a text string into a fixed-length rec sequence."""
     if lowercase:
         text = str(text).lower()
     rec = []
@@ -45,12 +42,11 @@ def text_to_rec(text: str, ctlabels, pad_token: int, max_len: int = 25,
 
 
 def decode_rec(rec, ctlabels, pad_token: int) -> str:
-    """CTC-decode a rec sequence back to a string (collapse repeats, skip blank/pad)."""
     last_char = None
     out = []
     for c in rec:
         c = int(c)
-        if c < pad_token - 1:   # < blank_token
+        if c < pad_token - 1:
             if last_char != c:
                 out.append(ctlabels[c])
                 last_char = c
@@ -126,6 +122,61 @@ def coco_ann_poly(ann):
 
 
 # ---------------------------------------------------------------------------
+# Bezier helpers
+# ---------------------------------------------------------------------------
+
+def sample_cubic_bezier(ctrl_pts, n=60):
+    """
+    Campiona n punti su una curva di Bezier cubica.
+    ctrl_pts: array (4, 2) dei punti di controllo.
+    Restituisce array (n, 2) di int.
+    """
+    p = np.array(ctrl_pts, dtype=np.float64)  # (4, 2)
+    u = np.linspace(0.0, 1.0, n)[:, None]     # (n, 1)
+    curve = (
+        ((1 - u) ** 3)            * p[0] +
+        (3 * u * (1 - u) ** 2)    * p[1] +
+        (3 * u ** 2 * (1 - u))    * p[2] +
+        (u ** 3)                  * p[3]
+    )
+    return curve.astype(np.int32)  # (n, 2)
+
+
+def draw_bezier_on_panel(draw, bezier_pts_flat,
+                         color_top=(255, 50, 50),
+                         color_bot=(50, 50, 255),
+                         color_ctrl=(255, 200, 0),
+                         width=2, dot_r=4):
+    """
+    Disegna le due curve di Bezier (bordo top in rosso, bordo bot in blu)
+    e i loro punti di controllo (gialli) sull'oggetto draw PIL.
+    bezier_pts_flat: lista/array di 16 float [top_4pts(8val) + bot_4pts(8val)].
+    """
+    if bezier_pts_flat is None or len(bezier_pts_flat) != 16:
+        return
+    pts = np.array(bezier_pts_flat, dtype=np.float64).reshape(8, 2)
+    top_ctrl = pts[:4]   # 4 punti di controllo bordo superiore
+    bot_ctrl = pts[4:]   # 4 punti di controllo bordo inferiore
+
+    for ctrl, color in [(top_ctrl, color_top), (bot_ctrl, color_bot)]:
+        curve = sample_cubic_bezier(ctrl, n=80)
+        curve_xy = [(int(p[0]), int(p[1])) for p in curve]
+        if len(curve_xy) >= 2:
+            draw.line(curve_xy, fill=color, width=width)
+        # Punti di controllo
+        for cp in ctrl:
+            cx, cy = int(cp[0]), int(cp[1])
+            draw.ellipse([cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r],
+                         fill=color_ctrl, outline=(0, 0, 0))
+
+    # Segmenti di controllo (linee tratteggiate simulate)
+    for ctrl, color in [(top_ctrl, color_top), (bot_ctrl, color_bot)]:
+        pts_xy = [(int(p[0]), int(p[1])) for p in ctrl]
+        draw.line(pts_xy, fill=(*color[:3], 120) if len(color) == 4 else color,
+                  width=1)
+
+
+# ---------------------------------------------------------------------------
 # Drawing helpers
 # ---------------------------------------------------------------------------
 
@@ -150,8 +201,8 @@ def parse_original_words(data, ctlabels, pad_token, lowercase=False):
     items = []
     for sample in data.get('annotations', []):
         image_id = sample.get('image_id', '')
-        width = int(sample.get('image_width', 1280) or 1280)
-        height = int(sample.get('image_height', 720) or 720)
+        width  = int(sample.get('image_width',  1280) or 1280)
+        height = int(sample.get('image_height',  720) or  720)
         words = []
         for para in sample.get('paragraphs', []):
             for line in para.get('lines', []):
@@ -160,7 +211,7 @@ def parse_original_words(data, ctlabels, pad_token, lowercase=False):
                     if not poly:
                         continue
                     raw_text = word.get('text', '')
-                    legible = word.get('legible', True)
+                    legible  = word.get('legible', True)
                     rec = text_to_rec(raw_text, ctlabels, pad_token,
                                       lowercase=lowercase)
                     dec = decode_rec(rec, ctlabels, pad_token)
@@ -194,13 +245,17 @@ def parse_coco(data, ctlabels, pad_token):
             dec = decode_rec(rec, ctlabels, pad_token) if rec else ann.get('text', '')
             if not dec:
                 dec = '[empty]'
-            words.append({'poly': poly, 'label': dec})
+            words.append({
+                'poly':        poly,
+                'label':       dec,
+                'bezier_pts':  ann.get('bezier_pts', None),
+            })
         items.append({
-            'image_id': Path(img.get('file_name', '')).stem,
+            'image_id':  Path(img.get('file_name', '')).stem,
             'file_name': img.get('file_name', ''),
-            'width': int(img.get('width', 1280) or 1280),
-            'height': int(img.get('height', 720) or 720),
-            'words': words,
+            'width':     int(img.get('width',  1280) or 1280),
+            'height':    int(img.get('height',  720) or  720),
+            'words':     words,
         })
     return items
 
@@ -225,7 +280,8 @@ def open_image(images_dir, image_id, file_name, width, height):
     return Image.new('RGB', (width, height), (128, 128, 128))
 
 
-def draw_panel(base_img, words, title, color_poly, color_text):
+def draw_panel_original(base_img, words, title, color_poly, color_text):
+    """Pannello sinistro: poligono originale HierText (verde)."""
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
     font = load_font(16)
@@ -242,20 +298,87 @@ def draw_panel(base_img, words, title, color_poly, color_text):
     return img
 
 
+def draw_panel_bezier(base_img, words, title, show_only_complex_poly=True):
+    """
+    Pannello destro: per ogni annotazione COCO mostra:
+      - Poligono originale (segmentation) in arancione, solo se vertici > 4
+      - Curve di Bezier top (rosso) e bottom (blu) con punti di controllo (giallo)
+      - Label del testo
+
+    show_only_complex_poly: se True mostra il poligono solo per annotazioni
+                            con numero di vertici > 4.
+    """
+    img = base_img.copy()
+    draw = ImageDraw.Draw(img)
+    font = load_font(16)
+    title_font = load_font(20)
+
+    draw.rectangle([0, 0, img.width, 30], fill=(20, 20, 20))
+    draw.text((10, 5), title, fill=(255, 255, 255), font=title_font)
+
+    # Legenda in basso
+    legend_y = img.height - 60
+    draw.rectangle([0, legend_y, img.width, img.height], fill=(20, 20, 20, 200))
+    small = load_font(13)
+    draw.rectangle([8,  legend_y + 6,  20, legend_y + 16], fill=(255, 140, 0))
+    draw.text((24, legend_y + 4),  'Poligono originale (vertici > 4)', fill=(220, 220, 220), font=small)
+    draw.rectangle([8,  legend_y + 22, 20, legend_y + 32], fill=(255, 50, 50))
+    draw.text((24, legend_y + 20), 'Bezier top',    fill=(220, 220, 220), font=small)
+    draw.rectangle([8,  legend_y + 38, 20, legend_y + 48], fill=(50, 50, 255))
+    draw.text((24, legend_y + 36), 'Bezier bottom', fill=(220, 220, 220), font=small)
+    draw.ellipse([200, legend_y + 20, 212, legend_y + 32], fill=(255, 200, 0), outline=(0,0,0))
+    draw.text((216, legend_y + 20), 'Punti di controllo', fill=(220, 220, 220), font=small)
+
+    for w in words:
+        pts     = w['poly']
+        bez_pts = w.get('bezier_pts', None)
+        label   = w['label']
+
+        n_verts = len(pts)
+
+        # Disegna il poligono originale solo se ha più di 4 vertici
+        if not show_only_complex_poly or n_verts > 4:
+            poly_color = (255, 140, 0)   # arancione
+            draw.line(pts + [pts[0]], fill=poly_color, width=2)
+            # Numera i vertici
+            for idx, (vx, vy) in enumerate(pts):
+                r = 3
+                draw.ellipse([vx-r, vy-r, vx+r, vy+r], fill=poly_color)
+                draw.text((int(vx)+4, int(vy)-8), str(idx),
+                          fill=poly_color, font=small)
+
+        # Disegna le curve di Bezier (se presenti nel JSON)
+        draw_bezier_on_panel(
+            draw, bez_pts,
+            color_top=(255, 50, 50),
+            color_bot=(50, 50, 255),
+            color_ctrl=(255, 200, 0),
+            width=2, dot_r=4
+        )
+
+        # Label testo
+        x0, y0, _, _ = poly_bbox(pts)
+        ly = max(32, int(y0) - 22)
+        draw_label(draw, int(x0), ly, f'[{n_verts}v] {label}', font,
+                   fg=(255, 255, 255), bg=(20, 80, 180))
+
+    return img
+
+
 def stack_side_by_side(left, right, header):
     w = left.width + right.width + 8
     h = max(left.height, right.height) + 70
     canvas = Image.new('RGB', (w, h), (245, 245, 245))
-    draw = ImageDraw.Draw(canvas)
-    font = load_font(22)
-    small = load_font(16)
+    draw   = ImageDraw.Draw(canvas)
+    font   = load_font(22)
+    small  = load_font(16)
     draw.rectangle([0, 0, w, 42], fill=(35, 35, 35))
     draw.text((12, 8), header, fill=(255, 255, 255), font=font)
-    canvas.paste(left, (0, 42))
+    canvas.paste(left,  (0, 42))
     canvas.paste(right, (left.width + 8, 42))
     draw.rectangle([left.width, 42, left.width + 8, h], fill=(220, 220, 220))
-    footer = ('Sinistra: originale con rec decodificato'
-              ' | Destra: JSON convertito con rec decodificato')
+    footer = ('Sinistra: poligoni HierText originali'
+              ' | Destra: poligoni (arancio, >4 vertici) + curve Bezier (rosso/blu)')
     draw.text((12, h - 22), footer, fill=(20, 20, 20), font=small)
     return canvas
 
@@ -266,23 +389,24 @@ def stack_side_by_side(left, right, header):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Visualizza e confronta annotazioni HierText originali vs COCO convertite.')
+        description='Visualizza annotazioni HierText: poligoni originali + curve Bezier.')
     ap.add_argument('--jsonl', required=True,
                     help='HierText source json/jsonl (annotazione originale)')
     ap.add_argument('--coco', required=True,
                     help='Converted COCO json (output di convert_hiertext.py)')
     ap.add_argument('--images', default='',
-                    help='Directory immagini (opzionale, mostra grigio se assente)')
+                    help='Directory immagini (opzionale, grigio se assente)')
     ap.add_argument('--out', default='debug_output',
                     help='Directory di output per le immagini debug')
     ap.add_argument('--n', type=int, default=5,
                     help='Numero di immagini da esportare')
     ap.add_argument('--voc', type=int, default=96, choices=[37, 96],
-                    help='Vocabulary size: 96 (default, ASCII stampabile) o 37 (legacy a-z0-9)')
+                    help='Vocabulary size: 96 (default) o 37 (legacy a-z0-9)')
+    ap.add_argument('--all-poly', action='store_true',
+                    help='Mostra tutti i poligoni nel pannello destro, non solo quelli con >4 vertici')
     args = ap.parse_args()
 
     ctlabels, blank_token, pad_token = build_vocab(args.voc)
-    # 37-voc: il testo originale deve essere lowercased prima dell'encoding
     lowercase = (args.voc == 37)
 
     print(f'[debug_hiertext] voc_size={args.voc}  '
@@ -299,31 +423,48 @@ def main():
     coco_items = parse_coco(coco_data, ctlabels, pad_token)
     coco_by_stem = {item['image_id']: item for item in coco_items}
 
+    show_only_complex = not args.all_poly
+
     count = 0
     for src in src_items:
         stem = src['image_id']
         coco = coco_by_stem.get(stem)
         if coco is None:
             continue
-        base  = open_image(args.images, stem, coco.get('file_name', ''),
-                           src['width'], src['height'])
-        left  = draw_panel(base, src['words'],
-                           f'PRIMA - boxes={len(src["words"])}',
-                           (0, 180, 0), (0, 120, 0))
-        right = draw_panel(base, coco['words'],
-                           f'DOPO  - boxes={len(coco["words"])}',
-                           (255, 140, 0), (20, 80, 180))
+
+        base = open_image(args.images, stem, coco.get('file_name', ''),
+                          src['width'], src['height'])
+
+        left = draw_panel_original(
+            base, src['words'],
+            f'ORIGINALE - parole={len(src["words"])}',
+            color_poly=(0, 180, 0), color_text=(0, 100, 0)
+        )
+        right = draw_panel_bezier(
+            base, coco['words'],
+            f'BEZIER + POLIGONI ({"solo >4 vertici" if show_only_complex else "tutti"})'
+            f'  -  parole={len(coco["words"])}',
+            show_only_complex_poly=show_only_complex
+        )
+
         board = stack_side_by_side(
             left, right,
-            f'id={stem} | prima={len(src["words"])} | dopo={len(coco["words"])}'
+            f'id={stem}  |  originale={len(src["words"])}  |  coco={len(coco["words"])}'
         )
+
+        # Statistiche rapide sui poligoni complessi
+        complex_count = sum(1 for w in coco['words'] if len(w['poly']) > 4)
+        bez_count     = sum(1 for w in coco['words'] if w.get('bezier_pts') is not None)
+        print(f'  {stem}: coco={len(coco["words"])} anns, '
+              f'poly>4v={complex_count}, con bezier_pts={bez_count}')
+
         out_path = out_dir / f'{stem}_debug.png'
         board.save(out_path)
         count += 1
         if count >= args.n:
             break
 
-    print(f'Salvate {count} immagini in {out_dir}')
+    print(f'\nSalvate {count} immagini in {out_dir}')
 
 
 if __name__ == '__main__':
