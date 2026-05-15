@@ -109,6 +109,10 @@ def _split_polygon_top_bottom(poly_xy):
     Strategia: usa make_valid_poly per correggere self-intersection e orientazione,
     poi prende i vertici dalla boundary principale e li spezza tra xmin e xmax.
     La catena con y_media minore e' considerata "top".
+
+    I vertici usati per top e bottom sono, per quanto possibile, disgiunti:
+    gli estremi comuni (sinistra/destra) vengono rimossi dalla catena bottom,
+    eccetto nei casi degeneri in cui non resterebbero abbastanza punti.
     """
     poly = make_valid_poly(poly_xy.tolist())
     xs, ys = poly.exterior.xy
@@ -131,6 +135,22 @@ def _split_polygon_top_bottom(poly_xy):
         top_chain, bottom_chain = chain1, chain2
     else:
         top_chain, bottom_chain = chain2, chain1
+
+    # Rendi i vertici delle due catene disgiunti rimuovendo gli estremi
+    # condivisi dalla catena bottom (salvo casi degeneri)
+    top_start = top_chain[0]
+    top_end = top_chain[-1]
+
+    mask = []
+    for p in bottom_chain:
+        if (np.allclose(p, top_start) or np.allclose(p, top_end)):
+            mask.append(False)
+        else:
+            mask.append(True)
+    mask = np.array(mask, dtype=bool)
+    bottom_pruned = bottom_chain[mask]
+    if len(bottom_pruned) >= 2:
+        bottom_chain = bottom_pruned
 
     return top_chain, bottom_chain
 
@@ -179,8 +199,8 @@ def _poly_to_bezier(poly_xy):
     con 4 punti di controllo per la parte alta e 4 per la parte bassa.
 
     Primo/ultimo punto di controllo coincidono sempre con i vertici estremi
-    della catena superiore/inferiore. I due punti centrali sono stimati via
-    least-squares usando BezierCurve, ma forzando il vincolo agli estremi.
+    della catena superiore/inferiore (dopo lo split disgiunto). I due punti
+    centrali sono stimati via least-squares usando BezierCurve.
     """
     poly_xy = np.asarray(poly_xy, dtype=np.float32)
     if len(poly_xy) < 2:
