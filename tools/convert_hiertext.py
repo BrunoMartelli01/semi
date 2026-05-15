@@ -96,13 +96,23 @@ def _split_polygon_top_bottom(poly_xy):
     poly_xy: array-like (N, 2) in pixel.
     Restituisce: top_chain, bottom_chain (entrambi np.ndarray (M,2), M>=2).
 
-    Strategia: usa make_valid_poly per correggere self-intersection e orientazione,
-    poi prende i vertici dalla boundary principale e li spezza tra xmin e xmax.
+    Strategia: usa make_valid_poly per correggere self-intersection e
+    orientazione, poi prende i vertici dalla boundary principale e li
+    spezza tra xmin e xmax.
     La catena con y_media minore e' considerata "top".
 
-    I vertici usati per top e bottom sono, per quanto possibile, disgiunti:
-    gli estremi comuni (sinistra/destra) vengono rimossi dalla catena bottom,
-    eccetto nei casi degeneri in cui non resterebbero abbastanza punti.
+    Disgiunzione stretta: top_chain include i vertici estremi sinistro e
+    destro (left_idx, right_idx); bottom_chain e' costruita escludendo per
+    indice questi due estremi, in modo che le due catene non condividano
+    mai alcun vertice.  Questo e' garantito dalla selezione degli indici,
+    senza fare affidamento su np.allclose (che puo' fallire dopo
+    make_valid_poly a causa di perturbazioni floating-point).
+
+    I punti di controllo iniziale/finale di ciascuna curva Bezier
+    devono coincidere con i vertici estremi della rispettiva catena:
+    questa funzione restituisce le catene grezze (non ricampionate) in
+    modo che _poly_to_bezier possa ancorare i ctrl-pts ai vertici
+    originali prima del resample.
     """
     poly = make_valid_poly(poly_xy.tolist())
     xs, ys = poly.exterior.xy
@@ -114,33 +124,34 @@ def _split_polygon_top_bottom(poly_xy):
     left_idx = int(np.argmin(pts[:, 0]))
     right_idx = int(np.argmax(pts[:, 0]))
 
+    N = len(pts)
+
     if left_idx < right_idx:
+        # chain con indici crescenti: left -> right (include entrambi gli estremi)
         chain1 = pts[left_idx:right_idx + 1]
-        chain2 = np.vstack([pts[right_idx:], pts[:left_idx + 1]])
+        # chain wrapping: right+1 ... N-1, 0 ... left-1
+        # ESCLUDI right_idx e left_idx per disgiunzione stretta
+        chain2_indices = list(range(right_idx + 1, N)) + list(range(0, left_idx))
+        if len(chain2_indices) >= 2:
+            chain2 = pts[chain2_indices]
+        else:
+            # catena troppo corta: usa i due estremi come fallback
+            chain2 = pts[[right_idx, left_idx]]
     else:
+        # chain con indici crescenti: left -> N-1, 0 -> right
         chain1 = np.vstack([pts[left_idx:], pts[:right_idx + 1]])
-        chain2 = pts[right_idx:left_idx + 1]
+        # chain interna: right+1 ... left-1
+        # ESCLUDI right_idx e left_idx per disgiunzione stretta
+        chain2_indices = list(range(right_idx + 1, left_idx))
+        if len(chain2_indices) >= 2:
+            chain2 = pts[chain2_indices]
+        else:
+            chain2 = pts[[right_idx, left_idx]]
 
     if chain1[:, 1].mean() <= chain2[:, 1].mean():
         top_chain, bottom_chain = chain1, chain2
     else:
         top_chain, bottom_chain = chain2, chain1
-
-    # Rendi i vertici delle due catene disgiunti rimuovendo gli estremi
-    # condivisi dalla catena bottom (salvo casi degeneri)
-    top_start = top_chain[0]
-    top_end = top_chain[-1]
-
-    mask = []
-    for p in bottom_chain:
-        if np.allclose(p, top_start) or np.allclose(p, top_end):
-            mask.append(False)
-        else:
-            mask.append(True)
-    mask = np.array(mask, dtype=bool)
-    bottom_pruned = bottom_chain[mask]
-    if len(bottom_pruned) >= 2:
-        bottom_chain = bottom_pruned
 
     return top_chain, bottom_chain
 
@@ -218,9 +229,19 @@ def _poly_to_bezier(poly_xy):
       [TOP_p0, TOP_p1, TOP_p2, TOP_p3, BOT_p0, BOT_p1, BOT_p2, BOT_p3]
     con 4 punti di controllo per la parte alta e 4 per la parte bassa.
 
-    Primo/ultimo punto di controllo coincidono sempre con i vertici estremi
-    della catena superiore/inferiore (dopo lo split disgiunto). I due punti
-    centrali sono stimati via least-squares usando BezierCurve.
+    Garanzie:
+    - Le catene top e bottom prodotte da _split_polygon_top_bottom sono
+      DISGIUNTE per costruzione (nessun vertice condiviso).
+    - I punti di controllo iniziale e finale di ciascuna curva coincidono
+      ESATTAMENTE con i vertici originali della catena (non con punti
+      del ricampionamento, che potrebbero differire per interpolazione).
+      Specificamente:
+        top_cp[0]  = top_chain[0]   (vertice sinistro originale)
+        top_cp[3]  = top_chain[-1]  (vertice destro originale)
+        bot_cp[0]  = bottom_chain[-1] (vertice destro originale, lato bot)
+        bot_cp[3]  = bottom_chain[0]  (vertice sinistro originale, lato bot)
+      La bottom curve e' percorsa destra->sinistra per compatibilita'
+      con create_gt_hiertext.
     """
     poly_xy = np.asarray(poly_xy, dtype=np.float32)
     if len(poly_xy) < 2:
@@ -228,36 +249,37 @@ def _poly_to_bezier(poly_xy):
         return [float(p[0])] * 8 + [float(p[1])] * 8
 
     top_chain, bottom_chain = _split_polygon_top_bottom(poly_xy)
-    top_chain_s = _resample_chain(top_chain, num_samples=20)
+
+    # Memorizza i vertici originali PRIMA del resample per ancorare i ctrl-pts
+    top_orig_start = top_chain[0].copy()    # vertice sinistro top
+    top_orig_end   = top_chain[-1].copy()   # vertice destro top
+    # bottom percorsa destra->sinistra: il "start" e' l'ultimo vertice della
+    # catena bottom (che corrisponde al lato destro del poligono) e il "end"
+    # e' il primo (lato sinistro).
+    bot_orig_start = bottom_chain[-1].copy()  # vertice destro bottom
+    bot_orig_end   = bottom_chain[0].copy()   # vertice sinistro bottom
+
+    top_chain_s    = _resample_chain(top_chain,    num_samples=20)
     bottom_chain_s = _resample_chain(bottom_chain, num_samples=20)
 
-    # fit robusto
-    top_cp = _fit_cubic_bezier(top_chain_s)
-    bot_cp_free = _fit_cubic_bezier(bottom_chain_s)
+    # fit robusto sui punti ricampionati
+    top_cp     = _fit_cubic_bezier(top_chain_s)
+    bot_cp_rev = _fit_cubic_bezier(bottom_chain_s[::-1])  # destra->sinistra
 
-    # forza il primo/ultimo ctrl point a coincidere con l'estremo della catena
-    # TOP: sinistra -> destra
-    top_p0 = top_chain_s[0]
-    top_p3 = top_chain_s[-1]
-    top_cp[0] = top_p0
-    top_cp[3] = top_p3
-
-    # BOT: destra -> sinistra (per compatibilita' con create_gt_hiertext)
-    bot_chain_s_rev = bottom_chain_s[::-1]
-    bot_p0 = bot_chain_s_rev[0]
-    bot_p3 = bot_chain_s_rev[-1]
-    bot_cp = bot_cp_free.copy()
-    bot_cp[0] = bot_p0
-    bot_cp[3] = bot_p3
+    # Ancora i punti di controllo iniziale e finale ai vertici ORIGINALI
+    top_cp[0] = top_orig_start
+    top_cp[3] = top_orig_end
+    bot_cp_rev[0] = bot_orig_start
+    bot_cp_rev[3] = bot_orig_end
 
     # clamp per sicurezza dentro il bounding box del poligono
     x_min, x_max = float(poly_xy[:, 0].min()), float(poly_xy[:, 0].max())
     y_min, y_max = float(poly_xy[:, 1].min()), float(poly_xy[:, 1].max())
-    for cp in (top_cp, bot_cp):
+    for cp in (top_cp, bot_cp_rev):
         cp[:, 0] = np.clip(cp[:, 0], x_min, x_max)
         cp[:, 1] = np.clip(cp[:, 1], y_min, y_max)
 
-    bez = np.concatenate([top_cp.reshape(-1), bot_cp.reshape(-1)]).astype(float)
+    bez = np.concatenate([top_cp.reshape(-1), bot_cp_rev.reshape(-1)]).astype(float)
     assert bez.shape[0] == 16
     return bez.tolist()
 
@@ -519,7 +541,7 @@ if __name__ == "__main__":
         mean_w = float(np.mean(bboxes[:, 2])) if bboxes.size else 0.0
         mean_h = float(np.mean(bboxes[:, 3])) if bboxes.size else 0.0
 
-        bez_lens = [len(a["bezier_pts"]) for a in anns]) if anns else []
+        bez_lens = [len(a["bezier_pts"]) for a in anns]
         wrong_bez = sum(1 for l in bez_lens if l != 16)
 
         status = []
