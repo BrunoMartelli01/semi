@@ -1,7 +1,21 @@
 import json
 import math
 import random
+import sys
+import os
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# BezierCurve from adet/utils/curve_utils
+# (imported here so convert_hiertext can be run standalone from repo root)
+# ---------------------------------------------------------------------------
+try:
+    from adet.utils.curve_utils import BezierCurve
+except ImportError:
+    # Fallback: insert repo root in path and try again
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from adet.utils.curve_utils import BezierCurve
+
 # 96-voc convention (same as CTW1500 / SemiETS):
 # ASCII printable characters: ' ' (32) ... '~' (126)  -> 95 symbols
 # CTLABELS[i] = chr(i + 32)  for i in 0..94
@@ -284,45 +298,78 @@ def _bbox_bezier_from_pts(pts):
     return bezier
 
 
-def _curve_to_bezier(curve):
-    """Adatta una polilinea 2D con una Bezier cubica (4 controlli) in least-squares."""
-    curve = np.asarray(curve, dtype=float).reshape(-1, 2)
-    m = len(curve)
-    if m <= 1:
-        return np.vstack([curve[0]] * 4)
+# ---------------------------------------------------------------------------
+# _curve_to_bezier: ora delega a BezierCurve da curve_utils
+# ---------------------------------------------------------------------------
+_bezier_curve_fitter = BezierCurve(order=3)  # cubica = 4 punti di controllo
+
+
+def _curve_to_bezier(chain):
+    """
+    Adatta una polilinea 2D (bordo superiore o inferiore di un testo) con
+    una curva di Bezier cubica (4 punti di controllo) usando BezierCurve
+    da adet/utils/curve_utils.
+
+    BezierCurve.get_middle_control_points risolve il problema ai minimi
+    quadrati tramite pseudoinversa della matrice di Bernstein, con
+    interpolazione a spline cubica opzionale per catene corte.
+
+    Args:
+        chain: lista di [x, y] con almeno 1 punto.
+
+    Returns:
+        np.ndarray shape (4, 2): i 4 punti di controllo della cubica.
+    """
+    chain = np.asarray(chain, dtype=float).reshape(-1, 2)
+    m = len(chain)
+
+    if m == 1:
+        return np.vstack([chain[0]] * 4)
 
     if m == 2:
-        p0, p3 = curve[0], curve[1]
-        p1 = _lerp(p0, p3, 1.0 / 3.0)
-        p2 = _lerp(p0, p3, 2.0 / 3.0)
-        return np.vstack([p0, p1, p2, p3])
+        p0, p3 = chain[0], chain[1]
+        p1 = p0 + (p3 - p0) / 3.0
+        p2 = p0 + (p3 - p0) * 2.0 / 3.0
+        return np.array([p0, p1, p2, p3])
 
-    diff = curve[1:] - curve[:-1]
-    dist = np.linalg.norm(diff, axis=-1)
-    total = dist.sum()
-    if total <= 1e-6:
-        return np.vstack([curve[0]] * 4)
+    # Usa BezierCurve: get_control_points chiama get_middle_control_points
+    # internamente e popola self.control_points.
+    # Usiamo interpolate=True quando la catena ha pochi punti (< 4) per
+    # evitare che la pseudoinversa sia mal condizionata.
+    bc = BezierCurve(order=3)
+    x = chain[:, 0]
+    y = chain[:, 1]
+    interpolate = m < 4
+    bc.get_control_points(x, y, interpolate=interpolate)
+    ctrl = np.array(bc.save_control_points())  # (4, 2)
 
-    norm = dist / total
-    norm = np.concatenate([[0.0], norm])
-    t = norm.cumsum()
-
-    B = np.stack([
-        (1 - t) ** 3,
-        3 * (1 - t) ** 2 * t,
-        3 * (1 - t) * t ** 2,
-        t ** 3
-    ], axis=1)
-
-    pseudo_inv = np.linalg.pinv(B)
-    ctrl = pseudo_inv.dot(curve)
-    ctrl[0] = curve[0]
-    ctrl[-1] = curve[-1]
+    # Forza i punti terminali esatti (p0 = chain[0], p3 = chain[-1])
+    # per garantire continuita' del contorno alle giunzioni top/bot.
+    ctrl[0] = chain[0]
+    ctrl[-1] = chain[-1]
     return ctrl
 
 
 def _poly_to_bezier(pts):
-    """Versione finale robusta per HierText, con controllo self-intersection."""
+    """
+    Converte un poligono HierText in 16 valori bezier_pts.
+
+    Struttura output (convenzione CTW1500 / SemiETS):
+      Punti 0-3: curva cubica TOP  (da sinistra a destra)
+      Punti 4-7: curva cubica BOT  (da destra a sinistra)
+      Totale: 8 punti x 2 coordinate = 16 float
+
+    Algoritmo per numero di vertici:
+      n==1 : punto singolo (degenere)
+      n==2 : segmento, punti interni interpolati linearmente
+      n==3 : triangolo (apice = TL=TR, base = BL/BR)
+      n==4 : quadrilatero riordinato con _reorder_quad
+      n>4  : catena top/bottom estratta per x (leftmost -> rightmost),
+             poi fittata con _curve_to_bezier (BezierCurve da curve_utils)
+
+    Dopo il fitting viene applicato il controllo _ring_has_self_intersection;
+    in caso positivo si torna al fallback bounding-box.
+    """
     pts = [list(p) for p in pts]
     if not pts:
         return [0.0] * 16
@@ -398,6 +445,7 @@ def _poly_to_bezier(pts):
         return bezier
 
     # n > 4: separa contorno in catena superiore/inferiore
+    # poi usa BezierCurve (curve_utils) per il fitting least-squares
     def _left_key(p):
         return (p[0], p[1])
 
@@ -427,8 +475,9 @@ def _poly_to_bezier(pts):
     if len(bot_chain) >= 2 and bot_chain[0][0] < bot_chain[-1][0]:
         bot_chain = list(reversed(bot_chain))
 
-    top_ctrl = _curve_to_bezier(top_chain)
-    bot_ctrl = _curve_to_bezier(bot_chain)
+    # --- fit con BezierCurve da curve_utils ---
+    top_ctrl = _curve_to_bezier(top_chain)   # (4, 2)
+    bot_ctrl = _curve_to_bezier(bot_chain)   # (4, 2)
 
     top_p0, top_p1, top_p2, top_p3 = top_ctrl.tolist()
     bot_p0, bot_p1, bot_p2, bot_p3 = bot_ctrl.tolist()
@@ -441,6 +490,7 @@ def _poly_to_bezier(pts):
         bezier = _bbox_bezier_from_pts(pts)
 
     return bezier
+
 
 def _bezier_bbox(bezier, img_w=None, img_h=None):
     """
@@ -533,14 +583,10 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
     Struttura bezier_pts (convenzione CTW1500):
       Punti 0-3: curva cubica TOP  (TL -> TR, da sinistra a destra)
       Punti 4-7: curva cubica BOT  (BR -> BL, da destra a sinistra)
-      I punti di controllo interni sono interpolati linearmente a 1/3 e 2/3.
 
-      Gestione poligoni complessi (FIX self-intersection):
-        - n==3 (triangolo): apice = TL=TR, base = BL/BR
-        - n==4 (quad):      _reorder_quad -> [TL, TR, BR, BL]
-        - n>4  (poligono):  _split_top_bottom_by_axis (PCA) -> top/bot
-          La separazione PCA gestisce poligoni obliqui, ruotati e concavi
-          dove la semplice divisione per y generava self-intersection.
+      Per n > 4 il fitting e' eseguito da BezierCurve (adet/utils/curve_utils)
+      tramite pseudoinversa della matrice di Bernstein, identico al metodo
+      usato nel pipeline SemiETS per i dataset CTW1500 e TotalText.
 
     Struttura bbox (convenzione CTW1500):
       Calcolata come min/max degli 8 punti di controllo bezier (NON dei
@@ -594,12 +640,11 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                         n_absolute += 1
 
                     # --- bezier_pts ---
-                    # _poly_to_bezier gestisce n==3, n==4 e n>4 con algoritmi
-                    # dedicati per prevenire self-intersection in tutti i casi.
+                    # _poly_to_bezier usa BezierCurve (curve_utils) per n>4,
+                    # con fallback bbox per self-intersection.
                     bezier = _poly_to_bezier(pts)
 
                     # --- bbox: min/max sugli 8 punti di controllo bezier, clippato ---
-                    # Identico alla procedura CTW1500 (verificata su train_96voc_1_labeled.json)
                     bbox = _bezier_bbox(bezier,
                                         img_w=img_w if img_w > 0 else None,
                                         img_h=img_h if img_h > 0 else None)
@@ -617,12 +662,8 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
                     if w_box <= 0 or h_box <= 0:
                         ignore = 1
 
-                    # area calcolata sulla bbox clippata (evita valori negativi)
                     area = round(w_box * h_box, 1) if w_box > 0 and h_box > 0 else 0.0
 
-                    # Annotazione nel formato CTW1500 esatto.
-                    # I campi con prefisso _ sono interni e vengono rimossi
-                    # prima della serializzazione finale.
                     ann = {
                         "image_id": img_id,
                         "area": area,
@@ -692,7 +733,6 @@ def convert(jsonl_path, out_json_path, out_gt_source_path, img_suffix='.jpg'):
     print(f"Scritto {out_gt_source_path}")
     print(f"  -> {len(annotations_all)} annotazioni totali (ignored incluse)")
 
-    # Restituisce anche le annotazioni grezze (con campi interni) per uso in make_semi_splits
     return images, annotations_all, annotations_supervised
 
 
@@ -727,10 +767,10 @@ def make_semi_splits(images, annotations_all, label_ratio, out_dir,
             "annotations": split_anns,
             "categories": CATEGORIES,
         }
-    if label_ratio * 100>= 1:
-        ratio_str = str(int(label_ratio*100))
+    if label_ratio * 100 >= 1:
+        ratio_str = str(int(label_ratio * 100))
     else:
-        ratio_str = str(label_ratio*100)
+        ratio_str = str(label_ratio * 100)
 
     labeled_path = f"{out_dir}/{split_name}_{ratio_str}_labeled.json"
     unlabeled_path = f"{out_dir}/{split_name}_{ratio_str}_unlabeled.json"
