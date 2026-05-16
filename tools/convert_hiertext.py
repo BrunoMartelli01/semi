@@ -184,7 +184,7 @@ def _split_polygon_top_bottom(poly_xy):
     # Nel poligono con orientamento CCW (Shapely default), il lato superiore
     # va da TL a TR in senso antiorario, cioe' con indici crescenti se
     # tl_idx < tr_idx, oppure con wrap-around altrimenti.
-    top_chain = _contour_slice(pts, tl_idx, tr_idx)
+    top_chain = _contour_slice(pts, tr_idx, tl_idx)
 
     # --- bottom chain: BL -> BR seguendo il contorno ---
     # Il lato inferiore va da BL a BR con indici crescenti (o wrap-around).
