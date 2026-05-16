@@ -90,121 +90,121 @@ def _vertices_to_pixels(verts, img_w, img_h):
     return pts, mode
 
 
-def _principal_axes(pts):
-    """Calcola l'asse principale (direzione di lettura) e l'asse perpendicolare
-    del poligono tramite PCA sui vertici.
+def _find_quad_corners(pts):
+    """Individua i 4 angoli logici (TL, TR, BR, BL) di un poligono di testo.
 
-    Ritorna:
-      axis_main  : np.ndarray (2,) - versore dell'asse principale (piu' lungo)
-      axis_perp  : np.ndarray (2,) - versore perpendicolare (oriented verso il basso)
+    I poligoni di testo sono sempre quadrilateri o deformazioni moderate di
+    essi.  La tecnica classica per trovare i 4 corner e' minimizzare/
+    massimizzare combinazioni lineari di x e y a 45 gradi, che corrispondono
+    alle diagonali del rettangolo:
 
-    L'asse principale e' orientato in modo che la sua componente x sia >= 0
-    (cioe' punta "verso destra"), garantendo che l'estremo sinistro abbia
-    proiezione minore di quello destro.
-    L'asse perpendicolare e' orientato in modo che la sua componente y >= 0
-    (cioe' punta "verso il basso" nello spazio immagine), in modo che la
-    catena con centroide proiettato positivo sull'asse perp. sia la bottom.
+      TL (top-left)     = argmin(x + y)    -- angolo in alto a sinistra
+      TR (top-right)    = argmax(x - y)    -- angolo in alto a destra
+      BR (bottom-right) = argmax(x + y)    -- angolo in basso a destra
+      BL (bottom-left)  = argmin(x - y)    -- angolo in basso a sinistra
+
+    Questo approccio e' robusto a rotazioni moderate e non richiede che
+    gli assi del testo siano allineati con gli assi dell'immagine.
+
+    Restituisce gli indici (tl_idx, tr_idx, br_idx, bl_idx) nel poligono pts.
     """
-    centered = pts - pts.mean(axis=0)
-    cov = centered.T @ centered / len(pts)
-    eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    # eigh ritorna autovalori in ordine crescente; il piu' grande e' l'asse principale
-    axis_main = eigenvectors[:, -1].astype(np.float64)
-    axis_perp = eigenvectors[:, 0].astype(np.float64)
+    x = pts[:, 0]
+    y = pts[:, 1]
+    tl_idx = int(np.argmin(x + y))
+    tr_idx = int(np.argmax(x - y))
+    br_idx = int(np.argmax(x + y))
+    bl_idx = int(np.argmin(x - y))
+    return tl_idx, tr_idx, br_idx, bl_idx
 
-    # Orienta axis_main verso destra (componente x >= 0)
-    if axis_main[0] < 0:
-        axis_main = -axis_main
 
-    # Orienta axis_perp verso il basso (componente y >= 0 nello spazio immagine
-    # dove y cresce verso il basso)
-    if axis_perp[1] < 0:
-        axis_perp = -axis_perp
+def _contour_slice(pts, start_idx, end_idx):
+    """Estrae una catena di vertici dal poligono seguendo il contorno in ordine
+    crescente degli indici (con wrap-around), da start_idx a end_idx INCLUSI.
 
-    return axis_main, axis_perp
+    Se start_idx == end_idx viene restituito il singolo vertice duplicato
+    (catena degenere di lunghezza 2) per evitare catene vuote.
+    """
+    N = len(pts)
+    if start_idx == end_idx:
+        return np.vstack([pts[start_idx], pts[start_idx]])
+    indices = []
+    i = start_idx
+    while True:
+        indices.append(i)
+        if i == end_idx:
+            break
+        i = (i + 1) % N
+        if len(indices) > N + 1:  # guard contro loop infiniti
+            break
+    return pts[indices]
 
 
 def _split_polygon_top_bottom(poly_xy):
-    """Divide un poligono chiuso in catena superiore e inferiore.
+    """Divide un poligono di testo in catena superiore (top) e inferiore (bottom).
 
     poly_xy: array-like (N, 2) in pixel.
     Restituisce: top_chain, bottom_chain (entrambi np.ndarray (M,2), M>=2).
 
-    Algoritmo robusto basato su PCA:
-    1. Calcola l'asse principale del poligono tramite PCA (rappresenta la
-       direzione di lettura, robusta a rotazioni e inclinazioni del testo).
-    2. Proietta tutti i vertici sull'asse principale per trovare gli estremi
-       "sinistro" (proj minima) e "destro" (proj massima) nel riferimento
-       allineato con il testo, invece di usare semplicemente argmin(x).
-    3. Spezza il contorno del poligono nei due estremi trovati, producendo
-       due catene di vertici.
-    4. Assegna top/bottom in base alla proiezione del centroide di ciascuna
-       catena sull'asse perpendicolare (orientato verso il basso): la catena
-       con centroide a proiezione perpendicolare piu' bassa e' la top.
+    Algoritmo basato sulla struttura rettangolare dei poligoni di testo:
 
-    Disgiunzione stretta: top_chain include i vertici degli estremi;
-    bottom_chain e' costruita escludendo per indice quegli estremi, senza
-    alcun confronto floating-point (np.allclose).
+    1. Individua i 4 corner logici TL, TR, BR, BL usando combinazioni a 45
+       gradi di x e y (_find_quad_corners).  Non si usa argmin(x)/argmax(x)
+       ne' PCA: le combinazioni diagonali sono robuste a inclinazioni moderate
+       del testo senza dipendere dall'allineamento con gli assi dell'immagine.
 
-    Robustezza rispetto al criterio precedente argmin(x)/argmax(x) + mean-Y:
-    - Funziona correttamente su testi ruotati, inclinati o obliqui.
-    - Non confonde l'estremo sinistro con un vertice della catena superiore
-      quando il testo e' molto inclinato.
-    - L'asse perp orientato garantisce che top sia sempre la catena verso
-      l'alto dell'immagine, indipendentemente dall'inclinazione.
+    2. Il contorno del poligono (in senso antiorario, dopo make_valid_poly)
+       viene spezzato in due catene seguendo gli indici:
+         top_chain:    TL -> TR  (seguendo il contorno: vertici superiori)
+         bottom_chain: BL -> BR  (seguendo il contorno: vertici inferiori)
+       Nel contorno antiorario, la catena TL->TR percorre il lato superiore,
+       e la catena BL->BR percorre il lato inferiore (in senso BL->BR per
+       avere sinistra->destra).
+       La bottom curve verra' poi percorsa al contrario (BR->BL) in
+       _poly_to_bezier per compatibilita' con create_gt_hiertext.
 
-    Casi degeneri: se il poligono ha <= 2 vertici entrambe le catene
-    coincidono con i punti disponibili.
+    3. Disgiunzione stretta: gli indici TL e TR appartengono alla top_chain;
+       BL e BR appartengono alla bottom_chain.  Se un corner coincide con
+       un altro (poligono degenere), i vertici vengono comunque assegnati
+       a una sola catena.
+
+    4. Fallback: se i 4 corner non sono tutti distinti o il poligono ha
+       troppo pochi vertici, si usa lo split per mean-Y come backup.
     """
     poly = make_valid_poly(poly_xy.tolist())
     xs, ys = poly.exterior.xy
     pts = np.stack([xs, ys], axis=1)[:-1]  # rimuovi duplicato finale
 
-    if len(pts) <= 2:
-        return pts, pts
-
-    # --- PCA per trovare l'asse principale del testo ---
-    axis_main, axis_perp = _principal_axes(pts)
-
-    # Proietta i vertici sull'asse principale
-    proj_main = pts @ axis_main
-
-    left_idx  = int(np.argmin(proj_main))  # estremo "sinistro" nel ref. ruotato
-    right_idx = int(np.argmax(proj_main))  # estremo "destro" nel ref. ruotato
-
     N = len(pts)
-
-    if left_idx == right_idx:
-        # Poligono degenere: tutti i punti allineati sull'asse perp
+    if N <= 2:
         return pts, pts
 
-    if left_idx < right_idx:
-        # chain1: left -> right  (include entrambi gli estremi)
-        chain1 = pts[left_idx:right_idx + 1]
-        # chain2: right+1 ... N-1, 0 ... left-1  (ESCLUDI gli estremi)
-        idx2 = list(range(right_idx + 1, N)) + list(range(0, left_idx))
-    else:
-        # chain1: left -> N-1, 0 -> right  (include entrambi gli estremi)
-        chain1 = np.vstack([pts[left_idx:], pts[:right_idx + 1]])
-        # chain2: right+1 ... left-1  (ESCLUDI gli estremi)
-        idx2 = list(range(right_idx + 1, left_idx))
+    tl_idx, tr_idx, br_idx, bl_idx = _find_quad_corners(pts)
 
-    if len(idx2) >= 2:
-        chain2 = pts[idx2]
-    else:
-        # catena troppo corta: duplica gli estremi come fallback
-        chain2 = pts[[left_idx, right_idx]]
+    # --- top chain: TL -> TR seguendo il contorno (indici crescenti) ---
+    # Nel poligono con orientamento CCW (Shapely default), il lato superiore
+    # va da TL a TR in senso antiorario, cioe' con indici crescenti se
+    # tl_idx < tr_idx, oppure con wrap-around altrimenti.
+    top_chain = _contour_slice(pts, tl_idx, tr_idx)
 
-    # --- Assegna top/bottom via proiezione sull'asse perpendicolare ---
-    # axis_perp e' orientato verso il basso (y cresce): centroide con
-    # proiezione perp piu' BASSA e' la catena superiore (top).
-    c1_perp = float((chain1 @ axis_perp).mean())
-    c2_perp = float((chain2 @ axis_perp).mean())
+    # --- bottom chain: BL -> BR seguendo il contorno ---
+    # Il lato inferiore va da BL a BR con indici crescenti (o wrap-around).
+    bottom_chain = _contour_slice(pts, bl_idx, br_idx)
 
-    if c1_perp <= c2_perp:
-        top_chain, bottom_chain = chain1, chain2
-    else:
-        top_chain, bottom_chain = chain2, chain1
+    # Sanity check: se una catena e' troppo corta o degenere usa fallback
+    if len(top_chain) < 2 or len(bottom_chain) < 2:
+        # Fallback: split per mean-Y
+        left_idx  = int(np.argmin(pts[:, 0]))
+        right_idx = int(np.argmax(pts[:, 0]))
+        if left_idx < right_idx:
+            c1 = pts[left_idx:right_idx + 1]
+            idx2 = list(range(right_idx + 1, N)) + list(range(0, left_idx))
+        else:
+            c1 = np.vstack([pts[left_idx:], pts[:right_idx + 1]])
+            idx2 = list(range(right_idx + 1, left_idx))
+        c2 = pts[idx2] if len(idx2) >= 2 else pts[[left_idx, right_idx]]
+        if c1[:, 1].mean() <= c2[:, 1].mean():
+            return c1, c2
+        return c2, c1
 
     return top_chain, bottom_chain
 
@@ -251,7 +251,6 @@ def _fit_cubic_bezier(chain_xy):
     dy = np.diff(y)
     dt = np.sqrt(dx ** 2 + dy ** 2)
     if dt.sum() < 1e-6:
-        # Tutti i punti quasi coincidenti -> retta degenerata
         p0 = chain_xy[0]
         p3 = chain_xy[-1]
         v = (p3 - p0) / 3.0
@@ -265,7 +264,6 @@ def _fit_cubic_bezier(chain_xy):
         cp = np.array(flat_cp, dtype=np.float32).reshape(4, 2)
         return cp
     except Exception:
-        # Fallback robusto in caso di problemi numerici/SVD
         p0 = chain_xy[0]
         p3 = chain_xy[-1]
         v = (p3 - p0) / 3.0
@@ -284,17 +282,16 @@ def _poly_to_bezier(poly_xy):
 
     Garanzie:
     - Le catene top e bottom prodotte da _split_polygon_top_bottom sono
-      DISGIUNTE per costruzione (nessun vertice condiviso).
+      DISGIUNTE per costruzione (nessun indice condiviso).
     - I punti di controllo iniziale e finale di ciascuna curva coincidono
       ESATTAMENTE con i vertici originali della catena (non con punti
-      del ricampionamento, che potrebbero differire per interpolazione).
-      Specificamente:
-        top_cp[0]  = top_chain[0]   (vertice sinistro originale)
-        top_cp[3]  = top_chain[-1]  (vertice destro originale)
-        bot_cp[0]  = bottom_chain[-1] (vertice destro originale, lato bot)
-        bot_cp[3]  = bottom_chain[0]  (vertice sinistro originale, lato bot)
-      La bottom curve e' percorsa destra->sinistra per compatibilita'
-      con create_gt_hiertext.
+      del ricampionamento):
+        top_cp[0]     = top_chain[0]      (angolo TL originale)
+        top_cp[3]     = top_chain[-1]     (angolo TR originale)
+        bot_cp_rev[0] = bottom_chain[-1]  (angolo BR originale)
+        bot_cp_rev[3] = bottom_chain[0]   (angolo BL originale)
+      La bottom curve e' percorsa BR->BL (destra->sinistra) per
+      compatibilita' con create_gt_hiertext.
     """
     poly_xy = np.asarray(poly_xy, dtype=np.float32)
     if len(poly_xy) < 2:
@@ -303,29 +300,25 @@ def _poly_to_bezier(poly_xy):
 
     top_chain, bottom_chain = _split_polygon_top_bottom(poly_xy)
 
-    # Memorizza i vertici originali PRIMA del resample per ancorare i ctrl-pts
-    top_orig_start = top_chain[0].copy()    # vertice sinistro top
-    top_orig_end   = top_chain[-1].copy()   # vertice destro top
-    # bottom percorsa destra->sinistra: il "start" e' l'ultimo vertice della
-    # catena bottom (che corrisponde al lato destro del poligono) e il "end"
-    # e' il primo (lato sinistro).
-    bot_orig_start = bottom_chain[-1].copy()  # vertice destro bottom
-    bot_orig_end   = bottom_chain[0].copy()   # vertice sinistro bottom
+    # Vertici originali prima del resample per ancorare i ctrl-pts
+    top_orig_start = top_chain[0].copy()     # angolo TL
+    top_orig_end   = top_chain[-1].copy()    # angolo TR
+    bot_orig_start = bottom_chain[-1].copy() # angolo BR (bottom percorsa BR->BL)
+    bot_orig_end   = bottom_chain[0].copy()  # angolo BL
 
     top_chain_s    = _resample_chain(top_chain,    num_samples=20)
     bottom_chain_s = _resample_chain(bottom_chain, num_samples=20)
 
-    # fit robusto sui punti ricampionati
     top_cp     = _fit_cubic_bezier(top_chain_s)
-    bot_cp_rev = _fit_cubic_bezier(bottom_chain_s[::-1])  # destra->sinistra
+    bot_cp_rev = _fit_cubic_bezier(bottom_chain_s[::-1])  # BR->BL
 
-    # Ancora i punti di controllo iniziale e finale ai vertici ORIGINALI
-    top_cp[0] = top_orig_start
-    top_cp[3] = top_orig_end
+    # Ancora ai vertici originali
+    top_cp[0]     = top_orig_start
+    top_cp[3]     = top_orig_end
     bot_cp_rev[0] = bot_orig_start
     bot_cp_rev[3] = bot_orig_end
 
-    # clamp per sicurezza dentro il bounding box del poligono
+    # clamp dentro il bounding box del poligono
     x_min, x_max = float(poly_xy[:, 0].min()), float(poly_xy[:, 0].max())
     y_min, y_max = float(poly_xy[:, 1].min()), float(poly_xy[:, 1].max())
     for cp in (top_cp, bot_cp_rev):
