@@ -263,8 +263,21 @@ class TextEvaluator():
             self.lexicon_type = None
         elif "cocotext" in self.dataset_name:
             self.lexicon_type = None
-        elif "hiertext" in self.dataset_name:   # [FIX 1] aggiunto ramo hiertext
-            self.lexicon_type = None
+        elif "hiertext" in self.dataset_name:
+            if not self.lexicon_type is None:
+                lexicon_path = 'datasets/hiertext/weak_voc_new.txt'
+                pair_list = open('datasets/hiertext/weak_voc_pair_list.txt', 'r')
+                pairs = dict()
+                for line in pair_list.readlines():
+                    line = line.strip()
+                    word = line.split(' ')[0].upper()
+                    word_gt = line[len(word) + 1:]
+                    pairs[word] = word_gt
+                lexicon_fid = open(lexicon_path, 'r')
+                lexicon = []
+                for line in lexicon_fid.readlines():
+                    line = line.strip()
+                    lexicon.append(line)
 
         def find_match_word(rec_str, pairs, lexicon=None):
             rec_str = rec_str.upper()
@@ -466,12 +479,9 @@ class TextEvaluator():
         if 'ic15' in self.dataset_name:
             single_train = (self.lexicon_type == 4)
             self.lexicon_type = 3
-
-        # [FIX 2] aggiunto 'and (not hiertext)' per escluderlo dal ramo con dict_lexicon
         if (not 'textocr' in self.dataset_name) and \
            (not 'ic15' in self.dataset_name or single_train) and \
-           (not 'cocotext' in self.dataset_name) and \
-           (not 'hiertext' in self.dataset_name):
+           (not 'cocotext' in self.dataset_name) :
             i = 0
             temp_dir = f'temp_evaluate_dir_{i}'
             while os.path.exists(temp_dir):
@@ -501,8 +511,7 @@ class TextEvaluator():
 
             return copy.deepcopy(self._results)
 
-        # [FIX 3] aggiunto 'or hiertext' per gestire hiertext senza dict_lexicon
-        elif 'textocr' in self.dataset_name or 'cocotext' in self.dataset_name or 'hiertext' in self.dataset_name:
+        elif 'textocr' in self.dataset_name or 'cocotext' in self.dataset_name :
             i = 0
             temp_dir = f'temp_evaluate_dir_{i}'
             while os.path.exists(temp_dir):

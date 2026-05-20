@@ -72,6 +72,6 @@ SSL:
   O2O_DECODER_LOSS : ["labels", "texts_adaptive_sci", "ctrl_points_adaptive_crc", "bd_points_adaptive_crc"]
 
 TEST:
-  EVAL_PERIOD: 1000
+  EVAL_PERIOD: 6000
 
 OUTPUT_DIR: "output/R50/hiertext/Finetune/semi_0.5s/SemiETS_0.5s"
