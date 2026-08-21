@@ -86,13 +86,21 @@ def plot_polygons_and_iou(poly1, poly2):
 
     # Show the plot
     plt.show()
-def calculate_iou_from_bds(selected_bds,target_bds):
-    selected_target_poly = make_valid_poly(pnt_to_Polygon(selected_bds))  # 50
+# def calculate_iou_from_bds(selected_bds,target_bds):
+#     selected_target_poly = make_valid_poly(pnt_to_Polygon(selected_bds))  # 50
+#     bd_points_poly = make_valid_poly(pnt_to_Polygon(target_bds))
+#     iou = get_intersection_over_union(selected_target_poly, bd_points_poly)
+#     return iou
+
+def calculate_iou_from_bds(selected_bds, target_bds):
+    selected_target_poly = make_valid_poly(pnt_to_Polygon(selected_bds))
     bd_points_poly = make_valid_poly(pnt_to_Polygon(target_bds))
+
+    if selected_target_poly.is_empty or bd_points_poly.is_empty:
+        return 0.0
+
     iou = get_intersection_over_union(selected_target_poly, bd_points_poly)
     return iou
-
-
 
 def SPOTTING_NMS(bds,scs,ctcs,recs,voc_size,iou_threshold=None):
     bds = bds.cpu().numpy()
@@ -269,24 +277,94 @@ def simplify_polygon(polygon_points, eps=1e-3, mode=1):
     else:
         return np.array(polygon_new.exterior.coords)
 
+# def make_valid_poly(pts):
+#     #pts -> valid Polygon
+#     #1.check valid Polygon
+#     pgt = Polygon(pts)
+#     if not pgt.is_valid:
+#         pts = simplify_polygon(pts,mode=1)
+#         pgt = Polygon(pts)
+#
+#     if not pgt.is_valid:
+#         pgt = Polygon(pts).convex_hull # other-wise use convex instead, with fewer points enclosed orignial Poly
+#         pts = mapping(pgt)['coordinates']
+#
+#     # 2.make sure the pts are clockwise.
+#     pRing = LinearRing(pts)
+#     if pRing.is_ccw:
+#         pts.reverse()
+#         pRing = LinearRing(pts)
+#         assert not pRing.is_ccw,"Points are not clockwise. The coordinates of bounding quadrilaterals have to be given in clockwise order. Regarding the correct interpretation of 'clockwise' remember that the image coordinate system used is the standard one, with the image origin at the upper left, the X axis extending to the right and Y axis extending downwards."
+#         pgt = Polygon(pts)
+#
+#     return pgt
+
+from shapely.geometry import Polygon, LinearRing, MultiPolygon, GeometryCollection
+from shapely.validation import make_valid as shapely_make_valid
+
 def make_valid_poly(pts):
-    #pts -> valid Polygon
-    #1.check valid Polygon
-    pgt = Polygon(pts)
-    if not pgt.is_valid:
-        pts = simplify_polygon(pts,mode=1)
+    """
+    Converte pts in un Polygon shapely valido e con anello esterno clockwise.
+    In caso di fallimento restituisce un Polygon vuoto (area=0).
+    """
+    # 0) Porta tutto a array 2D (N, 2)
+    pts = np.asarray(pts, dtype=float)
+    if pts.ndim == 3:      # es. mapping(polygon)['coordinates'] -> (1, N, 2)
+        pts = pts[0]
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        return Polygon()
+
+    # Rimuovi NaN/inf
+    mask_finite = np.isfinite(pts).all(axis=1)
+    pts = pts[mask_finite]
+    if pts.shape[0] < 4:
+        # meno di 4 punti => poligono degenere, lo trattiamo come vuoto
+        return Polygon()
+
+    # 1) prova a costruire un Polygon grezzo
+    try:
         pgt = Polygon(pts)
+    except Exception:
+        return Polygon()
 
+    if pgt.is_empty:
+        return Polygon()
+
+    # 2) se invalido, prova a ripararlo
     if not pgt.is_valid:
-        pgt = Polygon(pts).convex_hull # other-wise use convex instead, with fewer points enclosed orignial Poly
-        pts = mapping(pgt)['coordinates']
+        try:
+            pgt = shapely_make_valid(pgt)  # può dare GeometryCollection / linee[web:172][web:173]
+        except Exception:
+            try:
+                pgt = pgt.buffer(0)
+            except Exception:
+                return Polygon()
 
-    # 2.make sure the pts are clockwise.
-    pRing = LinearRing(pts)
+        # Se è una collezione o multipoligono, scegli il poligono con area massima
+        if isinstance(pgt, (MultiPolygon, GeometryCollection)):
+            polys = [g for g in getattr(pgt, "geoms", []) if isinstance(g, Polygon)]
+            if polys:
+                pgt = max(polys, key=lambda g: g.area)
+            else:
+                # niente poligoni dentro → hull può diventare LineString/Point[web:171]
+                pgt = pgt.convex_hull
+
+    # 3) Dopo tutto questo, assicurati di avere davvero un Polygon
+    if not isinstance(pgt, Polygon):
+        # convex_hull di pochi punti / punti allineati = LineString/Point → nessun area[web:171][web:177]
+        return Polygon()
+
+    if pgt.is_empty or pgt.area == 0:
+        return Polygon()
+
+    # 4) Prendi solo l’anello esterno e forza clockwise
+    coords = list(pgt.exterior.coords)
+    if len(coords) < 4:
+        return Polygon()
+
+    pRing = LinearRing(coords)
     if pRing.is_ccw:
-        pts.reverse()
-        pRing = LinearRing(pts)
-        assert not pRing.is_ccw,"Points are not clockwise. The coordinates of bounding quadrilaterals have to be given in clockwise order. Regarding the correct interpretation of 'clockwise' remember that the image coordinate system used is the standard one, with the image origin at the upper left, the X axis extending to the right and Y axis extending downwards."
-        pgt = Polygon(pts)
+        coords.reverse()
+        pRing = LinearRing(coords)
 
-    return pgt
+    return Polygon(pRing)

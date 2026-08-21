@@ -27,7 +27,7 @@ MODEL:
 INPUT:
   ROTATE: False
   MIN_SIZE_TRAIN: ( 798, 862,926,992, 1056, 1120, 1184)
-  MAX_SIZE_TRAIN: 1900
+  MAX_SIZE_TRAIN: 2000
   MIN_SIZE_TEST: 1600
   MAX_SIZE_TEST: 1920
 
@@ -43,7 +43,7 @@ SOLVER:
   LR_BACKBONE: 5e-6
   WARMUP_ITERS: 0
   STEPS: (8000,)            # lr decay a 10k iter
-  MAX_ITER: 12000
+  MAX_ITER: 24000
   CHECKPOINT_PERIOD: 500
   FIND_UNUSED_PARAMETERS: True
 
@@ -63,7 +63,7 @@ SSL:
   AUG_QUERY: False
   INFERENCE_ON: "teacher"
   STEP_HOOK: True
-  WARM_UP: 0  #debug
+  WARM_UP: 1000  #debug
   STAGE_WARM_UP: 4000
   EXTRA_STUDENT_INFO: True
   USE_CONSISTENCY: False
@@ -73,6 +73,6 @@ SSL:
   O2O_DECODER_LOSS : ["labels", "texts_adaptive_sci", "ctrl_points_adaptive_crc", "bd_points_adaptive_crc"]
 
 TEST:
-  EVAL_PERIOD: 100000
+  EVAL_PERIOD: 1000
 
-OUTPUT_DIR: "output/R50/hiertext/Finetune/semi_0.5s/SemiETS_0.5s"
+OUTPUT_DIR: "output/R50/hiertext/Finetune/semi_0.5s/SemiETS_0.5_tests"

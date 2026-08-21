@@ -106,7 +106,15 @@ class CtrlPointCost(nn.Module):
             C = self.class_weight * cost_class + self.coord_weight * cost_kpts
             C = C.view(bs, num_queries, -1).cpu() if sum(sizes) > 0 else torch.zeros((bs, num_queries, 0))
 
-
+            C_cpu = C.detach().to('cpu').float()
+            if not torch.isfinite(C_cpu).all():
+                print("Found non-finite in cost matrix")
+                print("min:", C_cpu.min().item(), "max:", C_cpu.max().item())
+                print("any NaN:", torch.isnan(C_cpu).any().item(),
+                      "any +Inf:", torch.isposinf(C_cpu).any().item(),
+                      "any -Inf:", torch.isneginf(C_cpu).any().item())
+                # opzionale: salva su file per una analisi successiva
+                torch.save(C_cpu, "debug_cost_matrix.pt")
             indices = []
             costs = []
             for i, c in enumerate(C.split(sizes, -1)):

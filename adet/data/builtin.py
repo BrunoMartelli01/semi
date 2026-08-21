@@ -20,7 +20,7 @@ _PREDEFINED_SPLITS_TEXT = {
     # HierText — 37-voc (legacy, kept for backward compatibility)
     # ------------------------------------------------------------------ #
     "hiertext_train": ("hiertext/train_images", "hiertext/train_37voc.json"),
-    "hiertext_test":  ("hiertext/validation_images", "hiertext/test.json"),
+    "hiertext_test":  ("hiertext/validation_images", "hiertext/test_filtered.json"),
 
     "hiertext_train_10_label":   ("hiertext/train_images", "hiertext/train_37voc_10_labeled.json"),
     "hiertext_train_10_unlabel": ("hiertext/train_images", "hiertext/train_37voc_10_unlabeled.json"),
